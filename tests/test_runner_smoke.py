@@ -9,8 +9,8 @@ import numpy as np
 
 from cpn_gf.analysis import analyze_path
 from cpn_gf.config import fingerprint, load_config, run_family_fingerprint
-from cpn_gf.runner import (_flow_buffer_configurations, _restore, _run_seed,
-                           pilot_config, resume_run, run_config)
+from cpn_gf.runner import (_flow_buffer_configurations, _restore, _run_pilot,
+                           _run_seed, pilot_config, resume_run, run_config)
 
 
 class RunnerSmokeTests(unittest.TestCase):
@@ -411,6 +411,80 @@ root = "{output}"
             with self.assertRaisesRegex(ValueError, "distinct mul_\\* directory names"):
                 load_config(path)
 
+    def test_pilot_lattice_defaults_preserve_single_attempt_behavior(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            self._write_config(path, "[1.0]", Path(directory) / "runs")
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write("\n[lattice]\nL0 = 37\n")
+            lattice = load_config(path)["lattice"]
+            self.assertEqual(lattice["L0"], 37)
+            self.assertEqual(lattice["max_L0"], 37)
+            self.assertEqual(lattice["target_L0_over_xi"], 2.0)
+
+    def test_invalid_pilot_lattice_growth_config_is_rejected(self):
+        cases = (("target_L0_over_xi = 1.9\nmax_L0 = 50", "at least 2"),
+                 ("target_L0_over_xi = 2\nmax_L0 = 19", "greater than or equal"),
+                 ("L0 = 20.5\ntarget_L0_over_xi = 2\nmax_L0 = 50", "positive integer"))
+        for values, message in cases:
+            with self.subTest(values=values), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.toml"
+                self._write_config(path, "[1.0]", Path(directory) / "runs")
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(f"\n[lattice]\n{values}\n")
+                with self.assertRaisesRegex(ValueError, message):
+                    load_config(path)
+
+    def test_pilot_retries_with_larger_lattice_until_target_ratio(self):
+        cfg = {
+            "lattice": {"L0": 20, "target_L0_over_xi": 2.0, "max_L0": 100,
+                        "pilot_warmup": 3, "pilot_total_samples": 8,
+                        "minimum_L": 6, "L_multiple": 6},
+            "hmc": {"chains": 4, "target_accept": 0.8},
+            "sampling": {"tau_window_c": 5.0},
+        }
+
+        class Engine:
+            step_size = 0.025
+
+        with patch("cpn_gf.runner._new_engine", side_effect=[Engine(), Engine()]) as create, \
+                patch("cpn_gf.runner.tune"), \
+                patch("cpn_gf.runner._collect_modes", return_value=object()), \
+                patch("cpn_gf.runner.scale_statistics", side_effect=[
+                    (12.2, np.asarray([12.0, 12.4]), 1.0),
+                    (10.0, np.asarray([9.8, 10.2]), 1.5)]):
+            result = _run_pilot(cfg, {"mul": 1.0}, 100)
+
+        self.assertEqual([call.args[2:5:2] for call in create.call_args_list],
+                         [(20, 100), (25, 101)])
+        self.assertEqual(result["L0"], 25)
+        self.assertEqual(result["attempt_count"], 2)
+        self.assertEqual([attempt["L0"] for attempt in result["attempts"]], [20, 25])
+        self.assertEqual(result["recommended_L"], 60)
+
+    def test_pilot_reports_failure_at_maximum_lattice(self):
+        cfg = {
+            "lattice": {"L0": 20, "target_L0_over_xi": 2.0, "max_L0": 25,
+                        "pilot_warmup": 3, "pilot_total_samples": 8,
+                        "minimum_L": 6, "L_multiple": 6},
+            "hmc": {"chains": 4, "target_accept": 0.8},
+            "sampling": {"tau_window_c": 5.0},
+        }
+
+        class Engine:
+            step_size = 0.025
+
+        with patch("cpn_gf.runner._new_engine", side_effect=[Engine(), Engine(), Engine()]) as create, \
+                patch("cpn_gf.runner.tune"), \
+                patch("cpn_gf.runner._collect_modes", return_value=object()), \
+                patch("cpn_gf.runner.scale_statistics", side_effect=[
+                    (12.0, np.asarray([12.0, 12.0]), 1.0),
+                    (13.0, np.asarray([13.0, 13.0]), 1.0),
+                    (13.0, np.asarray([13.0, 13.0]), 1.0)]):
+            with self.assertRaisesRegex(RuntimeError, "max_L0=25.*below target 2"):
+                _run_pilot(cfg, {"mul": 1.0}, 100)
+        self.assertEqual([call.args[2] for call in create.call_args_list], [20, 24, 25])
+
     def test_analysis_uses_only_muls_listed_in_root_config(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "experiment"
@@ -507,7 +581,9 @@ root = "{output}"
                 xi = float(model["mul"]) * 2
                 return {"xi": xi, "xi_error": 0.1, "tau_max": 1.5, "L0": 20,
                         "L": 30, "recommended_L": 30, "step_size": 0.02,
-                        "samples_per_chain": 2, "total_samples": 128}
+                        "samples_per_chain": 2, "total_samples": 128,
+                        "attempt_count": 1,
+                        "attempts": [{"L0": 20, "xi": xi, "L0_over_xi": 20 / xi}]}
 
             with patch("cpn_gf.runner._run_pilot", side_effect=pilot_result):
                 result = pilot_config(config)
@@ -515,6 +591,13 @@ root = "{output}"
             experiment = Path(result["experiment"])
             self.assertTrue((experiment / "pilot_results.json").is_file())
             self.assertTrue((experiment / "pilot_results.csv").is_file())
+            summary = json.loads((experiment / "pilot_results.json")
+                                 .read_text(encoding="utf-8"))
+            self.assertEqual(summary["runs"][0]["attempt_count"], 1)
+            self.assertEqual(summary["runs"][0]["attempts"][0]["L0"], 20)
+            csv_header = (experiment / "pilot_results.csv").read_text(
+                encoding="utf-8").splitlines()[0]
+            self.assertIn("attempt_count", csv_header)
             self.assertEqual([item["action"] for item in result["runs"]],
                              ["piloted", "piloted"])
             for mul in (0.7, 0.8):

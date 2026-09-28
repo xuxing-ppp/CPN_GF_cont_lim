@@ -11,7 +11,8 @@ from pathlib import Path
 DEFAULTS = {
     "model": {"N": 2, "beta": 1.0, "beta1": 0.0, "alpha": 0.0,
               "alpha1": 0.0, "mod": 0, "mul": [1.0], "normalize": True},
-    "lattice": {"L": 0, "L0": 50, "L_multiple": 6, "minimum_L": 6,
+    "lattice": {"L": 0, "L0": 50, "target_L0_over_xi": 2.0, "max_L0": None,
+                "L_multiple": 6, "minimum_L": 6,
                 "pilot_warmup": 400, "pilot_total_samples": 10000},
     "hmc": {"chains": 64, "warmup": 2000, "target_accept": 0.8,
             "initial_step_size": 0.01, "trajectory_length": 0.4,
@@ -52,6 +53,30 @@ def validate(cfg):
         raise ValueError("model.N must be greater than one")
     if int(cfg["hmc"]["chains"]) < 2:
         raise ValueError("at least two independent HMC chains are required")
+    lat = cfg["lattice"]
+    try:
+        initial_L0 = float(lat["L0"])
+    except (TypeError, ValueError) as exc:
+        raise TypeError("lattice.L0 must be an integer") from exc
+    if not math.isfinite(initial_L0) or initial_L0 <= 0 or not initial_L0.is_integer():
+        raise ValueError("lattice.L0 must be a positive integer")
+    lat["L0"] = int(initial_L0)
+    try:
+        target_ratio = float(lat["target_L0_over_xi"])
+    except (TypeError, ValueError) as exc:
+        raise TypeError("lattice.target_L0_over_xi must be a number") from exc
+    if not math.isfinite(target_ratio) or target_ratio < 2:
+        raise ValueError("lattice.target_L0_over_xi must be finite and at least 2")
+    lat["target_L0_over_xi"] = target_ratio
+    try:
+        maximum = initial_L0 if lat["max_L0"] is None else float(lat["max_L0"])
+    except (TypeError, ValueError) as exc:
+        raise TypeError("lattice.max_L0 must be an integer") from exc
+    if not math.isfinite(maximum) or maximum <= 0 or not maximum.is_integer():
+        raise ValueError("lattice.max_L0 must be a positive integer")
+    if maximum < initial_L0:
+        raise ValueError("lattice.max_L0 must be greater than or equal to lattice.L0")
+    lat["max_L0"] = int(maximum)
     try:
         mul = [float(x) for x in cfg["model"]["mul"]]
     except (TypeError, ValueError) as exc:

@@ -60,21 +60,47 @@ def _new_engine(cfg, model, L, chains, seed):
 def _run_pilot(cfg, model, seed):
     lat, hmc = cfg["lattice"], cfg["hmc"]
     chains = int(hmc["chains"])
-    engine = _new_engine(cfg, model, int(lat["L0"]), chains, seed)
-    with tqdm(total=int(lat["pilot_warmup"]), desc="pilot warmup", leave=False) as bar:
-        tune(engine, lat["pilot_warmup"], hmc["target_accept"], bar)
+    current_L0 = int(lat["L0"])
+    maximum_L0 = int(lat["max_L0"])
+    target_ratio = float(lat["target_L0_over_xi"])
     per_chain = math.ceil(int(lat["pilot_total_samples"]) / chains)
-    modes = _collect_modes(engine, per_chain, 1, "pilot scale")
-    xi, xi_loo, tau = scale_statistics(
-        modes, int(lat["L0"]), cfg["sampling"]["tau_window_c"])
-    if (not np.isfinite(xi) or not np.all(np.isfinite(xi_loo))
-            or xi <= 0 or xi > int(lat["L0"]) / 2):
-        raise RuntimeError(f"pilot produced invalid xi={xi}; increase lattice.L0 or pilot statistics")
+    attempts = []
+
+    while True:
+        attempt_index = len(attempts)
+        engine = _new_engine(cfg, model, current_L0, chains, seed + attempt_index)
+        with tqdm(total=int(lat["pilot_warmup"]), desc=f"pilot warmup L0={current_L0}",
+                  leave=False) as bar:
+            tune(engine, lat["pilot_warmup"], hmc["target_accept"], bar)
+        modes = _collect_modes(engine, per_chain, 1, f"pilot scale L0={current_L0}")
+        xi, xi_loo, tau = scale_statistics(
+            modes, current_L0, cfg["sampling"]["tau_window_c"])
+        if not np.isfinite(xi) or not np.all(np.isfinite(xi_loo)) or xi <= 0:
+            raise RuntimeError(
+                f"pilot produced invalid xi={xi} at L0={current_L0}; "
+                "increase pilot statistics")
+
+        xi_error = float(jackknife_error(xi_loo))
+        ratio = current_L0 / float(xi)
+        attempts.append({"L0": current_L0, "xi": float(xi), "xi_error": xi_error,
+                         "tau_max": float(tau), "L0_over_xi": ratio,
+                         "step_size": float(engine.step_size),
+                         "samples_per_chain": per_chain,
+                         "total_samples": per_chain * chains})
+        if ratio >= target_ratio:
+            break
+        if current_L0 >= maximum_L0:
+            raise RuntimeError(
+                f"pilot reached lattice.max_L0={maximum_L0} with xi={xi:.8g} "
+                f"and L0/xi={ratio:.8g}, below target {target_ratio:.8g}")
+        current_L0 = min(maximum_L0, math.ceil(target_ratio * float(xi)))
+
     L = max(int(lat["minimum_L"]), int(lat["L_multiple"]) * math.ceil(xi))
-    return {"xi": xi, "xi_error": float(jackknife_error(xi_loo)),
-            "tau_max": tau, "L0": int(lat["L0"]), "L": L,
-            "recommended_L": L, "step_size": engine.step_size,
-            "samples_per_chain": per_chain, "total_samples": per_chain * chains}
+    return {"xi": float(xi), "xi_error": xi_error, "tau_max": float(tau),
+            "L0": current_L0, "L": L, "recommended_L": L,
+            "step_size": float(engine.step_size), "samples_per_chain": per_chain,
+            "total_samples": per_chain * chains, "attempt_count": len(attempts),
+            "attempts": attempts}
 
 
 def _flow_steps(rho, xi, xi_loo, epsilon):
@@ -381,6 +407,8 @@ def _pilot_summary_row(manifest):
             "step_size": pilot.get("step_size"),
             "samples_per_chain": pilot.get("samples_per_chain"),
             "total_samples": pilot.get("total_samples"),
+            "attempt_count": pilot.get("attempt_count"),
+            "attempts": pilot.get("attempts"),
             "error": manifest.get("error")}
 
 
@@ -399,7 +427,8 @@ def _write_pilot_summary(experiment_dir):
     csv_path = Path(experiment_dir) / "pilot_results.csv"
     tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
     fields = ("mul", "status", "xi", "xi_error", "tau_max", "L0", "recommended_L",
-              "production_L", "step_size", "samples_per_chain", "total_samples", "error")
+              "production_L", "step_size", "samples_per_chain", "total_samples",
+              "attempt_count", "error")
     with tmp.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()

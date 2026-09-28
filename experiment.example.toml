@@ -20,8 +20,12 @@ normalize = true
 [lattice]
 # [新增] 正数表示直接固定生产格点 L×L；0 表示先做 pilot 自动估计 L。
 L = 0
-# [沿用] pilot 使用的试探格点。应足够大，使 pilot xi < L0/2。
+# pilot 使用的初始试探格点。
 L0 = 50
+# pilot 要求中心估计满足 L0/xi 不小于此值；不足时会增大 L0 并重跑。
+target_L0_over_xi = 2
+# 自动扩展试探格点的上限；到达上限仍不满足目标时会报错。
+max_L0 = 100
 # [沿用] 自动格点取 L=L_multiple*ceil(xi_pilot)，再受 minimum_L 下限约束。
 L_multiple = 6
 minimum_L = 20

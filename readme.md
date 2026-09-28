@@ -110,7 +110,11 @@ value and restart their consecutive-convergence count.
 
 Set `compute.device = "cpu"` for CPU. Production calculations use
 `float64/complex128` on both devices. `lattice.L = 0` enables the pilot that
-chooses `L`; a positive value uses that lattice size directly.
+chooses `L`; a positive value uses that lattice size directly. The pilot starts
+at `lattice.L0`. If its central estimate does not satisfy
+`L0 / xi >= lattice.target_L0_over_xi`, it reruns on a larger trial lattice up
+to `lattice.max_L0`. Omitting `max_L0` makes it equal to `L0`, preserving the
+single-attempt behavior of older configurations.
 
 ## Choosing the chain count
 

@@ -9,7 +9,7 @@ import numpy as np
 
 from cpn_gf.analysis import analyze_path
 from cpn_gf.config import fingerprint, load_config, run_family_fingerprint
-from cpn_gf.runner import (_flow_buffer_configurations, _restore, _run_pilot,
+from cpn_gf.runner import (SCHEMA, _flow_buffer_configurations, _restore, _run_pilot,
                            _run_seed, pilot_config, resume_run, run_config)
 
 
@@ -57,6 +57,7 @@ minimum_flow_stride = 1
 [flow]
 rho = [0.01]
 epsilon = 0.05
+kinds = ["model", "covariant"]
 buffer_configurations = 12
 [compute]
 device = "cpu"
@@ -66,15 +67,23 @@ root = "{output}"
 ''', encoding="utf-8")
             experiment, manifests = run_config(config)
             run_dir = next(experiment.glob("mul_*"))
-            self.assertTrue((run_dir / "results.npz").is_file())
+            self.assertTrue((run_dir / "results" / "model.npz").is_file())
+            self.assertTrue((run_dir / "results" / "covariant.npz").is_file())
             self.assertTrue((run_dir / "checkpoint.pt").is_file())
             self.assertFalse(any((run_dir / "observations").glob("*config*")))
-            with np.load(run_dir / "results.npz", allow_pickle=False) as data:
-                self.assertEqual(data["n_samples_per_chain"].tolist(), [2] * 6)
-                self.assertIn("unflowed_chi_m", data.files)
-                self.assertIn("unflowed_chi_t_Q_z", data.files)
-                self.assertIn("unflowed_chi_t_Q_U", data.files)
-                self.assertFalse(bool(data["unflowed_Q_s_applicable"]))
+            for kind in ("model", "covariant"):
+                with np.load(run_dir / "results" / f"{kind}.npz",
+                             allow_pickle=False) as data:
+                    self.assertEqual(data["n_samples_per_chain"].tolist(), [2] * 6)
+                    self.assertIn("unflowed_chi_m", data.files)
+                    self.assertIn("unflowed_chi_t_Q_z", data.files)
+                    self.assertIn("unflowed_chi_t_Q_U", data.files)
+                    self.assertFalse(bool(data["unflowed_Q_s_applicable"]))
+            chunk = next((run_dir / "observations").glob("flow_*.npz"))
+            with np.load(chunk, allow_pickle=False) as data:
+                self.assertEqual(data["flow_kinds"].tolist(), ["model", "covariant"])
+                self.assertIn("model__E_action", data.files)
+                self.assertIn("covariant__E_action", data.files)
             self.assertIn(manifests[0]["status"], ("ok", "complete_with_warning"))
             self.assertIsNone(manifests[0]["acceptance_rate_s"])
             self.assertEqual(manifests[0]["completed_total_samples"], 12)
@@ -90,6 +99,20 @@ root = "{output}"
         self.assertEqual(_flow_buffer_configurations(cfg, 48, 64), 384)
         self.assertEqual(_flow_buffer_configurations(cfg, 96, 64), 128)
         self.assertEqual(_flow_buffer_configurations(cfg, 160, 64), 64)
+
+    def test_flow_kinds_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.toml"
+            for value, message in (("[]", "non-empty"),
+                                   ('["model", "model"]', "duplicates"),
+                                   ('["unknown"]', "unsupported")):
+                path.write_text(f"[flow]\nkinds = {value}\n", encoding="utf-8")
+                with self.assertRaisesRegex((ValueError, TypeError), message):
+                    load_config(path)
+            path.write_text('[flow]\nkinds = ["model", "covariant"]\n',
+                            encoding="utf-8")
+            self.assertEqual(load_config(path)["flow"]["kinds"],
+                             ["model", "covariant"])
 
     def test_experiment_resume_prioritizes_checkpoint_then_starts_added_mul(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -255,7 +278,7 @@ root = "{output}"
             old_cfg, new_cfg = load_config(old_config), load_config(new_config)
             run_dir = root / "mul_0.8"
             run_dir.mkdir()
-            manifest = {"schema_version": 1, "config_fingerprint": fingerprint(old_cfg),
+            manifest = {"schema_version": SCHEMA, "config_fingerprint": fingerprint(old_cfg),
                         "phase": "production", "status": "running",
                         "model": {"mul": 0.8}, "L": 8, "chains": 4,
                         "sampling": old_cfg["sampling"], "analysis": old_cfg["analysis"]}
@@ -288,7 +311,7 @@ root = "{output}"
             old_cfg, new_cfg = load_config(old_config), load_config(new_config)
             run_dir = root / "mul_0.8"
             run_dir.mkdir()
-            manifest = {"schema_version": 1, "config_fingerprint": fingerprint(old_cfg),
+            manifest = {"schema_version": SCHEMA, "config_fingerprint": fingerprint(old_cfg),
                         "phase": "complete", "status": "ok",
                         "model": {"mul": 0.8}, "L": 8, "chains": 4,
                         "sampling": old_cfg["sampling"], "analysis": old_cfg["analysis"]}
@@ -498,7 +521,7 @@ root = "{output}"
                     "model": {"mul": mul}}), encoding="utf-8")
 
             def fake_analyze(run, **kwargs):
-                return {}, {"run": Path(run).name}
+                return {}, {"model": {"run": Path(run).name}}
 
             with patch("cpn_gf.analysis.analyze_run", side_effect=fake_analyze) as analyze, \
                     patch("cpn_gf.analysis._continuum_analysis") as continuum:
@@ -520,9 +543,10 @@ root = "{output}"
                 (run / "manifest.json").write_text(json.dumps({
                     "phase": "complete", "status": "ok",
                     "model": {"mul": mul}}), encoding="utf-8")
-                (run / "results.json").write_text(json.dumps({
+                (run / "results").mkdir()
+                (run / "results" / "model.json").write_text(json.dumps({
                     "xi_scale": mul, "xi_scale_error": 0.1}), encoding="utf-8")
-                np.savez(run / "results.npz", rho=np.asarray([0.1]),
+                np.savez(run / "results" / "model.npz", rho=np.asarray([0.1]),
                          target_times=np.asarray([1.0]),
                          tE_action=np.asarray([0.2]),
                          tE_action_error=np.asarray([0.01]))
@@ -620,7 +644,7 @@ root = "{output}"
             run_dir = root / "mul_0.8"
             run_dir.mkdir()
             shutil.copy2(config, run_dir / "config.toml")
-            manifest = {"schema_version": 1, "config_fingerprint": fingerprint(cfg),
+            manifest = {"schema_version": SCHEMA, "config_fingerprint": fingerprint(cfg),
                 "phase": "pilot_complete", "status": "pilot_complete",
                 "model": {"mul": 0.8}, "analysis": cfg["analysis"],
                 "run_seed": _run_seed(cfg, 0.8)}
@@ -642,7 +666,7 @@ root = "{output}"
             cfg = load_config(config)
             run_dir = root / "mul_0.8"
             run_dir.mkdir()
-            manifest = {"schema_version": 1, "config_fingerprint": fingerprint(cfg),
+            manifest = {"schema_version": SCHEMA, "config_fingerprint": fingerprint(cfg),
                         "phase": "production", "status": "running",
                         "model": {"mul": 0.8}, "L": 8, "chains": 4,
                         "analysis": {"min_t_over_a2_for_fit": 1.0}}

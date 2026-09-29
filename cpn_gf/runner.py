@@ -25,7 +25,7 @@ from .stats import jackknife_error, scale_statistics
 
 # First public on-disk format of the refactored online pipeline. Increment only
 # when a future change makes existing manifests/checkpoints unsafe to resume.
-SCHEMA = 1
+SCHEMA = 2
 
 
 def _device(cfg):
@@ -259,6 +259,7 @@ def _restore(cfg, run_dir):
 
 def _production(cfg, run_dir, engine, manifest, samples, chunks, streak):
     sampling, flow = cfg["sampling"], cfg["flow"]
+    flow_kinds = list(flow["kinds"])
     steps = np.asarray(manifest["output_steps"], dtype=int)
     times = steps * float(flow["epsilon"])
     chains = int(manifest["chains"])
@@ -288,21 +289,32 @@ def _production(cfg, run_dir, engine, manifest, samples, chunks, streak):
                 s_buffer.append(engine.s.clone())
         z_batch, a_batch = torch.cat(z_buffer), torch.cat(a_buffer)
         s_batch = torch.cat(s_buffer) if s_buffer else None
-        values, kind, used = flow_observables(z_batch, a_batch, s_batch, manifest["model"],
-                                              flow, steps, engine.device)
-        block = values.reshape(take, chains, len(steps), 6).transpose(1, 0, 2, 3)
+        blocks, engine_kinds, micro_batches = {}, {}, {}
+        for flow_kind in flow_kinds:
+            values, engine_kind, used = flow_observables(
+                z_batch, a_batch, s_batch, manifest["model"], flow, steps,
+                engine.device, flow_kind)
+            blocks[flow_kind] = values.reshape(
+                take, chains, len(steps), 6).transpose(1, 0, 2, 3)
+            engine_kinds[flow_kind] = engine_kind
+            micro_batches[flow_kind] = used
         q_s = (None if s_batch is None else
                s_batch.sum(dim=(1, 2)).reshape(take, chains).T.cpu().numpy())
         peak_mib = (torch.cuda.max_memory_allocated(engine.device) / 2 ** 20
                     if engine.device.type == "cuda" else 0.0)
         chunk_path = run_dir / "observations" / f"flow_{chunks:08d}.npz"
-        archive = {"E_action": block[..., 0], "S00": block[..., 1],
-                   "S10": block[..., 2], "S01": block[..., 3],
-                   "Q_z": block[..., 4], "Q_U": block[..., 5],
-                   "output_steps": steps, "times": times,
-                   "observable_schema": np.asarray(1),
-                   "first_sample": np.asarray(samples), "flow_kind": np.asarray(kind),
-                   "micro_batch_used": np.asarray(used), "peak_memory_mib": np.asarray(peak_mib)}
+        archive = {"output_steps": steps, "times": times,
+                   "observable_schema": np.asarray(2),
+                   "first_sample": np.asarray(samples),
+                   "flow_kinds": np.asarray(flow_kinds),
+                   "peak_memory_mib": np.asarray(peak_mib)}
+        observable_names = ("E_action", "S00", "S10", "S01", "Q_z", "Q_U")
+        for flow_kind, block in blocks.items():
+            for index, name in enumerate(observable_names):
+                archive[f"{flow_kind}__{name}"] = block[..., index]
+            archive[f"{flow_kind}__engine_kind"] = np.asarray(engine_kinds[flow_kind])
+            archive[f"{flow_kind}__micro_batch_used"] = np.asarray(
+                micro_batches[flow_kind])
         if q_s is not None:
             archive["Q_s"] = q_s
         atomic_npz(chunk_path, **archive)
@@ -314,31 +326,43 @@ def _production(cfg, run_dir, engine, manifest, samples, chunks, streak):
         manifest.update(completed_samples_per_chain=samples,
                         completed_total_samples=samples * chains,
                         committed_chunks=chunks,
-                        effective_flow_micro_batch=used,
+                        effective_flow_micro_batch=micro_batches,
                         peak_memory_mib=max(float(manifest.get("peak_memory_mib", 0)), peak_mib))
         atomic_json(run_dir / "manifest.json", manifest)
         if samples >= minimum and samples // check_every > (samples - take) // check_every:
-            _, summary = analyze_run(
+            _, summaries = analyze_run(
                 run_dir, write=True,
                 minimum_flow_time=cfg["analysis"]["min_t_over_a2_for_fit"])
-            maximum_error = summary["maximum_tE_relative_error"]
-            maximum_time = summary["maximum_tE_relative_error_flow_time"]
+            eligible = [(kind, summary["maximum_tE_relative_error"],
+                         summary["maximum_tE_relative_error_flow_time"])
+                        for kind, summary in summaries.items()
+                        if summary["maximum_tE_relative_error"] is not None]
+            worst = max(eligible, key=lambda item: item[1]) if eligible else None
+            maximum_error = None if worst is None else worst[1]
+            maximum_time = None if worst is None else worst[2]
             if maximum_error is None:
                 progress.set_postfix_str("max rel err=N/A @ t/a^2=N/A")
             else:
                 progress.set_postfix_str(
-                    f"max rel err={maximum_error:.3e} @ t/a^2={maximum_time:g}")
-            streak = streak + 1 if summary["converged"] else 0
+                    f"max rel err={maximum_error:.3e} ({worst[0]}) @ t/a^2={maximum_time:g}")
+            all_converged = all(summary["converged"] for summary in summaries.values())
+            streak = streak + 1 if all_converged else 0
             _write_checkpoint(run_dir, engine, "production", samples=samples, chunks=chunks,
                               convergence_streak=streak)
             if streak >= needed:
                 converged = True
                 break
     progress.close()
-    result, summary = analyze_run(
+    _, summaries = analyze_run(
         run_dir, write=True,
         minimum_flow_time=cfg["analysis"]["min_t_over_a2_for_fit"])
-    converged = converged or (summary["converged"] and streak >= needed)
+    all_converged = all(summary["converged"] for summary in summaries.values())
+    converged = converged or (all_converged and streak >= needed)
+    eligible = [(kind, summary["maximum_tE_relative_error"],
+                 summary["maximum_tE_relative_error_flow_time"])
+                for kind, summary in summaries.items()
+                if summary["maximum_tE_relative_error"] is not None]
+    worst = max(eligible, key=lambda item: item[1]) if eligible else None
     s_acceptance = (None if engine.s is None else
                     (engine.accepted_metro.double()
                      / torch.clamp(engine.attempted_metro, min=1)).cpu().numpy())
@@ -346,9 +370,15 @@ def _production(cfg, run_dir, engine, manifest, samples, chunks, streak):
                     converged=converged, completed_samples_per_chain=samples,
                     completed_total_samples=samples * chains,
                     completed_at=datetime.now().isoformat(timespec="seconds"),
-                    maximum_tE_relative_error=summary["maximum_tE_relative_error"],
-                    maximum_tE_relative_error_flow_time=(
-                        summary["maximum_tE_relative_error_flow_time"]),
+                    flow_convergence={kind: {
+                        "converged": summary["converged"],
+                        "maximum_tE_relative_error": summary["maximum_tE_relative_error"],
+                        "maximum_tE_relative_error_flow_time":
+                            summary["maximum_tE_relative_error_flow_time"]}
+                        for kind, summary in summaries.items()},
+                    maximum_tE_relative_error=None if worst is None else worst[1],
+                    maximum_tE_relative_error_flow_time=None if worst is None else worst[2],
+                    maximum_tE_relative_error_flow_kind=None if worst is None else worst[0],
                     acceptance_rate_hmc=(engine.accepted_hmc.double()
                                          / torch.clamp(engine.attempted_hmc, min=1)).cpu().numpy(),
                     acceptance_rate_s=s_acceptance)

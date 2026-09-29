@@ -7,9 +7,11 @@ from .flow_engine import TorchCPNFlowBatch
 
 
 @torch.no_grad()
-def flow_observables(z, a, s, model, flow_cfg, output_steps, device):
+def flow_observables(z, a, s, model, flow_cfg, output_steps, device, flow_kind):
     """Flow snapshots without modifying the live HMC tensors."""
-    kind = ("covariant" if flow_cfg["covariant"] else
+    if flow_kind not in ("model", "covariant"):
+        raise ValueError(f"unsupported flow kind: {flow_kind}")
+    kind = ("covariant" if flow_kind == "covariant" else
             "halfRefVil" if abs(model["alpha"]) < 1e-8 else "RefVil_fix_s")
     params = {**model, "flow_epsilon": float(flow_cfg["epsilon"]),
               "mass_a": float(flow_cfg["mass_a"]), "mass_z": float(flow_cfg["mass_z"])}

@@ -17,7 +17,8 @@ def _progress(iterable, enabled, desc, total=None):
     return tqdm(iterable, total=total, desc=desc, leave=False)
 
 
-def load_chain_values(run_dir, chains, progress=False, progress_prefix=""):
+def load_chain_values(run_dir, chains, flow_kind, expected_kinds,
+                      progress=False, progress_prefix=""):
     run_dir = Path(run_dir)
     parts = sorted((run_dir / "observations").glob("flow_*.npz"))
     if not parts:
@@ -30,13 +31,12 @@ def load_chain_values(run_dir, chains, progress=False, progress_prefix=""):
                       total=len(parts))
     for path in paths:
         with np.load(path, allow_pickle=False) as data:
-            if "values" in data.files:
-                values = data["values"]
-                if values.shape[-1] == 5:
-                    values = np.concatenate((values, np.full(values.shape[:-1] + (1,), np.nan)), axis=-1)
-            else:
-                values = np.stack([data[name] for name in
-                                   ("E_action", "S00", "S10", "S01", "Q_z", "Q_U")], axis=-1)
+            recorded_kinds = [str(x) for x in data["flow_kinds"].tolist()]
+            if recorded_kinds != list(expected_kinds):
+                raise RuntimeError(
+                    f"flow kinds in {path} are {recorded_kinds}, expected {list(expected_kinds)}")
+            values = np.stack([data[f"{flow_kind}__{name}"] for name in
+                               ("E_action", "S00", "S10", "S01", "Q_z", "Q_U")], axis=-1)
             if values.shape[0] != chains:
                 raise RuntimeError(f"chain count mismatch in {path}")
             steps = data["output_steps"]
@@ -79,17 +79,17 @@ def _relative_error_summary(relative_errors, target_times, threshold, minimum_fl
             "converged": bool(np.all(selected <= float(threshold)))}
 
 
-def analyze_run(run_dir, write=True, minimum_flow_time=None, progress=False):
+def _analyze_kind(run_dir, manifest, flow_kind, write=True,
+                  minimum_flow_time=None, progress=False):
     run_dir = Path(run_dir)
-    with (run_dir / "manifest.json").open(encoding="utf-8") as fh:
-        manifest = json.load(fh)
     with np.load(run_dir / "scale.npz", allow_pickle=False) as scale:
         xi, xi_loo = float(scale["xi"]), scale["xi_loo"].copy()
     rho, L = np.asarray(manifest["flow"]["rho"], dtype=float), int(manifest["L"])
     chains = int(manifest["chains"])
     prefix = f"{run_dir.name}: "
     chain_values, chain_qs, times, output_steps, parts = load_chain_values(
-        run_dir, chains, progress=progress, progress_prefix=prefix)
+        run_dir, chains, flow_kind, manifest["flow"]["kinds"], progress=progress,
+        progress_prefix=f"{prefix}{flow_kind}: ")
     values, errors, target_times = analyze_flow(
         chain_values, times, rho, xi, xi_loo, L, progress=progress,
         progress_prefix=prefix)
@@ -139,18 +139,30 @@ def analyze_run(run_dir, write=True, minimum_flow_time=None, progress=False):
     summary["flowed"]["tE_action"] = {
         "mean": result["tE_action"], "error": result["tE_action_error"]}
     if write:
-        atomic_npz(run_dir / "results.npz", **result)
-        atomic_json(run_dir / "results.json", summary)
-        _plot_run(run_dir, result)
+        atomic_npz(run_dir / "results" / f"{flow_kind}.npz", **result)
+        atomic_json(run_dir / "results" / f"{flow_kind}.json", summary)
+        _plot_run(run_dir, flow_kind, result)
     return result, summary
 
 
-def _plot_run(run_dir, result):
+def analyze_run(run_dir, write=True, minimum_flow_time=None, progress=False):
+    run_dir = Path(run_dir)
+    with (run_dir / "manifest.json").open(encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    results, summaries = {}, {}
+    for flow_kind in manifest["flow"]["kinds"]:
+        results[flow_kind], summaries[flow_kind] = _analyze_kind(
+            run_dir, manifest, flow_kind, write=write,
+            minimum_flow_time=minimum_flow_time, progress=progress)
+    return results, summaries
+
+
+def _plot_run(run_dir, flow_kind, result):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    plot_dir = Path(run_dir) / "plots"
-    plot_dir.mkdir(exist_ok=True)
+    plot_dir = Path(run_dir) / "plots" / flow_kind
+    plot_dir.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(6.4, 4.8))
     ax.errorbar(result["rho"], result["tE_action"], yerr=result["tE_action_error"],
                 marker="o", capsize=3)
@@ -190,28 +202,34 @@ def analyze_path(path, progress=False, aggregate_only=False):
         raise RuntimeError(f"no production runs found below {path}")
     minimum_flow_time = float(cfg["analysis"]["min_t_over_a2_for_fit"])
     summaries = {}
+    flow_kinds = cfg["flow"]["kinds"]
     if aggregate_only:
-        missing = [run for run in runs if not (run / "results.json").is_file()
-                   or not (run / "results.npz").is_file()]
+        missing = [run for run in runs for kind in flow_kinds
+                   if not (run / "results" / f"{kind}.json").is_file()
+                   or not (run / "results" / f"{kind}.npz").is_file()]
         if missing:
             names = ", ".join(run.name for run in missing)
             raise RuntimeError(f"aggregate-only analysis requires existing results for: {names}")
         run_iterator = _progress(runs, progress, "load mul results", total=len(runs))
         for run in run_iterator:
-            with (run / "results.json").open(encoding="utf-8") as fh:
-                summaries[run.name] = json.load(fh)
+            summaries[run.name] = {}
+            for kind in flow_kinds:
+                with (run / "results" / f"{kind}.json").open(encoding="utf-8") as fh:
+                    summaries[run.name][kind] = json.load(fh)
     else:
         run_iterator = _progress(runs, progress, "analyze mul runs", total=len(runs))
         for run in run_iterator:
             summaries[run.name] = analyze_run(
                 run, write=True, minimum_flow_time=minimum_flow_time,
                 progress=progress)[1]
-    _continuum_analysis(path, runs, summaries, progress=progress)
-    atomic_json(path / "analysis.json", summaries)
+    for kind in flow_kinds:
+        _continuum_analysis(path, runs, summaries, kind, progress=progress)
+        atomic_json(path / "analysis" / f"{kind}.json",
+                    {name: value[kind] for name, value in summaries.items()})
     return summaries
 
 
-def _continuum_analysis(root, runs, summaries, progress=False):
+def _continuum_analysis(root, runs, summaries, flow_kind, progress=False):
     """Quadratic 1/xi^2 extrapolation of tE at fixed rho across mul runs."""
     from scipy import odr
     import matplotlib
@@ -225,8 +243,8 @@ def _continuum_analysis(root, runs, summaries, progress=False):
     for run in runs:
         with (run / "manifest.json").open(encoding="utf-8") as fh:
             manifest = json.load(fh)
-        with np.load(run / "results.npz", allow_pickle=False) as data:
-            entries.append((float(manifest["model"]["mul"]), summaries[run.name],
+        with np.load(run / "results" / f"{flow_kind}.npz", allow_pickle=False) as data:
+            entries.append((float(manifest["model"]["mul"]), summaries[run.name][flow_kind],
                             {k: data[k].copy() for k in ("rho", "target_times", "tE_action",
                                                          "tE_action_error")}))
     reference = entries[0][2]["rho"]
@@ -235,7 +253,7 @@ def _continuum_analysis(root, runs, summaries, progress=False):
     minimum_flow_time = (configured_threshold if configured_threshold is not None else
                          float(json.loads((runs[0] / "manifest.json").read_text(encoding="utf-8"))
                                .get("analysis", {}).get("min_t_over_a2_for_fit", 1.0)))
-    out, plot_dir = {}, Path(root) / "plots" / "continuum"
+    out, plot_dir = {}, Path(root) / "plots" / flow_kind / "continuum"
     plot_dir.mkdir(parents=True, exist_ok=True)
     rho_iterator = _progress(enumerate(reference), progress, "continuum fits",
                              total=len(reference))
@@ -310,6 +328,6 @@ def _continuum_analysis(root, runs, summaries, progress=False):
     ax.grid(alpha=0.25)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(Path(root) / "plots" / "tE_action_vs_rho_by_mul.png", dpi=180)
+    fig.savefig(Path(root) / "plots" / flow_kind / "tE_action_vs_rho_by_mul.png", dpi=180)
     plt.close(fig)
-    atomic_json(Path(root) / "continuum_fits.json", out)
+    atomic_json(Path(root) / "continuum_fits" / f"{flow_kind}.json", out)

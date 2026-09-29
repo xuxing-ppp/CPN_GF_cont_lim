@@ -18,12 +18,12 @@ class OnlineAnalysisTests(unittest.TestCase):
     def test_cli_analysis_summary_is_compact(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            atomic_json(root / "continuum_fits.json", {
+            atomic_json(root / "continuum_fits" / "model.json", {
                 "rho_0.1": {"fit": {"continuum": 1.0}},
                 "rho_0.2": {"fit": None}})
             output = io.StringIO()
-            summaries = {"mul_0.8": {"flowed": {"large": list(range(100))}},
-                         "mul_0.9": {"flowed": {"large": list(range(100))}}}
+            summaries = {"mul_0.8": {"model": {"flowed": {"large": list(range(100))}}},
+                         "mul_0.9": {"model": {"flowed": {"large": list(range(100))}}}}
 
             with redirect_stdout(output):
                 _print_analysis_summary(root, summaries, aggregate_only=True)
@@ -31,7 +31,7 @@ class OnlineAnalysisTests(unittest.TestCase):
             text = output.getvalue()
             self.assertIn("mode: aggregate only", text)
             self.assertIn("mul runs: mul_0.8, mul_0.9", text)
-            self.assertIn("continuum fits: 1/2 rho values", text)
+            self.assertIn("model continuum fits: 1/2 rho values", text)
             self.assertNotIn("large", text)
 
     def test_continuum_uses_quadratic_fit_and_writes_mul_comparison(self):
@@ -51,22 +51,25 @@ class OnlineAnalysisTests(unittest.TestCase):
                 xi = float(index + 2)
                 inverse_xi2 = 1.0 / xi ** 2
                 observable = 1.0 + 2.0 * inverse_xi2 + 3.0 * inverse_xi2 ** 2
-                atomic_npz(run / "results.npz", rho=np.asarray([0.1]),
+                atomic_npz(run / "results" / "model.npz", rho=np.asarray([0.1]),
                            target_times=np.asarray([5.0]),
                            tE_action=np.asarray([observable]),
                            tE_action_error=np.asarray([0.01]))
                 runs.append(run)
-                summaries[run.name] = {"xi_scale": xi, "xi_scale_error": 0.01}
+                summaries[run.name] = {
+                    "model": {"xi_scale": xi, "xi_scale_error": 0.01}}
 
-            _continuum_analysis(root, runs, summaries)
+            _continuum_analysis(root, runs, summaries, "model")
 
-            fits = json.loads((root / "continuum_fits.json").read_text(encoding="utf-8"))
+            fits = json.loads((root / "continuum_fits" / "model.json")
+                               .read_text(encoding="utf-8"))
             fit = fits["rho_0.100000"]["fit"]
             self.assertEqual(fit["model"], "quadratic_in_inverse_xi2")
             self.assertAlmostEqual(fit["quadratic"], 3.0, places=6)
             self.assertAlmostEqual(fit["slope"], 2.0, places=6)
             self.assertAlmostEqual(fit["continuum"], 1.0, places=6)
-            self.assertTrue((root / "plots" / "tE_action_vs_rho_by_mul.png").is_file())
+            self.assertTrue((root / "plots" / "model" /
+                             "tE_action_vs_rho_by_mul.png").is_file())
 
     def test_vectorized_interpolation_matches_numpy(self):
         rng = np.random.default_rng(14)
@@ -85,7 +88,7 @@ class OnlineAnalysisTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             rho = [0.05, 0.1]
-            manifest = {"flow": {"rho": rho}, "L": 8, "chains": 3,
+            manifest = {"flow": {"rho": rho, "kinds": ["model"]}, "L": 8, "chains": 3,
                         "sampling": {"relative_error": 1.0},
                         "analysis": {"min_t_over_a2_for_fit": 0.0}}
             atomic_json(root / "manifest.json", manifest)
@@ -100,10 +103,15 @@ class OnlineAnalysisTests(unittest.TestCase):
                                rng.integers(-2, 3, shape),
                                rng.integers(-2, 3, shape)), axis=-1)
             q_s = rng.integers(-3, 4, (3, 4))
-            atomic_npz(root / "observations" / "flow_00000000.npz", values=values, Q_s=q_s,
+            names = ("E_action", "S00", "S10", "S01", "Q_z", "Q_U")
+            archived = {f"model__{name}": values[..., index]
+                        for index, name in enumerate(names)}
+            atomic_npz(root / "observations" / "flow_00000000.npz", Q_s=q_s,
+                       flow_kinds=np.asarray(["model"]), **archived,
                        output_steps=np.asarray([0, 10, 20, 40]),
                        times=np.asarray([0.0, 0.1, 0.2, 0.4]))
-            result, summary = analyze_run(root)
+            results, summaries = analyze_run(root)
+            result, summary = results["model"], summaries["model"]
             self.assertEqual(result["tE_action"].shape, (2,))
             self.assertEqual(result["n_samples_per_chain"].tolist(), [4, 4, 4])
             self.assertTrue(np.isfinite(summary["maximum_tE_relative_error"]))

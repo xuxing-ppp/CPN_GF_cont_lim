@@ -13,7 +13,8 @@ def _print_analysis_summary(path, summaries, aggregate_only=False):
     path = Path(path)
     print(f"Analysis complete: {path}")
     if (path / "manifest.json").is_file():
-        summary = next(iter(summaries.values()))
+        by_kind = next(iter(summaries.values()))
+        summary = next(iter(by_kind.values()))
         xi = summary.get("xi_scale")
         xi_error = summary.get("xi_scale_error")
         if xi is not None and xi_error is not None:
@@ -23,21 +24,22 @@ def _print_analysis_summary(path, summaries, aggregate_only=False):
             low, high = int(min(samples)), int(max(samples))
             value = str(low) if low == high else f"{low}-{high}"
             print(f"samples per chain: {value}")
-        if "converged" in summary:
-            print(f"converged: {bool(summary['converged'])}")
-        print(f"outputs: {path / 'results.json'}, {path / 'results.npz'}, {path / 'plots'}")
+        for kind, item in by_kind.items():
+            print(f"{kind} converged: {bool(item['converged'])}")
+        print(f"outputs: {path / 'results'}, {path / 'plots'}")
         return
 
     mode = "aggregate only" if aggregate_only else "per-mul and aggregate"
     print(f"mode: {mode}")
     print("mul runs: " + ", ".join(summaries))
-    fits_path = path / "continuum_fits.json"
-    if fits_path.is_file():
-        with fits_path.open(encoding="utf-8") as fh:
-            fits = json.load(fh)
-        fitted = sum(item.get("fit") is not None for item in fits.values())
-        print(f"continuum fits: {fitted}/{len(fits)} rho values")
-    print(f"outputs: {path / 'analysis.json'}, {fits_path}, {path / 'plots'}")
+    fits_dir = path / "continuum_fits"
+    if fits_dir.is_dir():
+        for fits_path in sorted(fits_dir.glob("*.json")):
+            with fits_path.open(encoding="utf-8") as fh:
+                fits = json.load(fh)
+            fitted = sum(item.get("fit") is not None for item in fits.values())
+            print(f"{fits_path.stem} continuum fits: {fitted}/{len(fits)} rho values")
+    print(f"outputs: {path / 'analysis'}, {fits_dir}, {path / 'plots'}")
 
 
 def main(argv=None):

@@ -67,8 +67,11 @@ def _measure_candidate(cfg, model, L, chains, repeats=3, trajectories=3):
         # count.  The real flow can still split this into smaller micro-batches.
         z, a = engine.z.clone(), engine.a.clone()
         s = None if engine.s is None else engine.s.clone()
-        _, _, micro_batch = flow_observables(
-            z, a, s, model, cfg["flow"], np.asarray([0, 1]), device)
+        micro_batches = []
+        for flow_kind in cfg["flow"]["kinds"]:
+            _, _, micro_batch = flow_observables(
+                z, a, s, model, cfg["flow"], np.asarray([0, 1]), device, flow_kind)
+            micro_batches.append(micro_batch)
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             peak = int(torch.cuda.max_memory_allocated(device))
@@ -77,7 +80,7 @@ def _measure_candidate(cfg, model, L, chains, repeats=3, trajectories=3):
         within_budget = budget is None or peak <= budget
         return {"chains": chains, "status": "ok" if within_budget else "over_budget",
                 "rate": rate, "peak_bytes": peak, "budget_bytes": budget,
-                "flow_micro_batch": int(micro_batch)}
+                "flow_micro_batch": int(min(micro_batches))}
     except torch.cuda.OutOfMemoryError:
         return {"chains": chains, "status": "oom", "rate": None,
                 "peak_bytes": None, "budget_bytes": budget, "flow_micro_batch": None}

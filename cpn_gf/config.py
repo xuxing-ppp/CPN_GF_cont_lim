@@ -26,7 +26,7 @@ DEFAULTS = {
                  "minimum_flow_stride": 20, "tau_window_c": 5.0},
     "flow": {"rho": [0.01, 0.05, 0.09, 0.13, 0.17, 0.21, 0.25],
              "epsilon": 0.01, "mass_a": 1.0, "mass_z": 1.0,
-             "covariant": False, "buffer_configurations": 0},
+             "kinds": ["model"], "buffer_configurations": 0},
     "analysis": {"min_t_over_a2_for_fit": 1.0},
     "compute": {"device": "cuda:0", "dtype": "float64", "seed": 12345,
                 "deterministic": True, "max_vram_fraction": 0.70},
@@ -91,6 +91,16 @@ def validate(cfg):
     rho = [float(x) for x in cfg["flow"]["rho"]]
     if not rho or any(x <= 0 for x in rho) or any(b <= a for a, b in zip(rho, rho[1:])):
         raise ValueError("flow.rho must be positive and strictly increasing")
+    kinds = cfg["flow"]["kinds"]
+    if not isinstance(kinds, list) or not kinds:
+        raise ValueError("flow.kinds must be a non-empty list")
+    if any(not isinstance(kind, str) for kind in kinds):
+        raise TypeError("flow.kinds entries must be strings")
+    if len(set(kinds)) != len(kinds):
+        raise ValueError("flow.kinds must not contain duplicates")
+    unknown_kinds = set(kinds) - {"model", "covariant"}
+    if unknown_kinds:
+        raise ValueError(f"unsupported flow.kinds: {sorted(unknown_kinds)}")
     s = cfg["sampling"]
     if not 0 < float(s["relative_error"]) < 1:
         raise ValueError("sampling.relative_error must lie in (0, 1)")

@@ -137,6 +137,30 @@ class TorchFlowParityTests(unittest.TestCase):
         expected_initial = np.stack([self._cpu_measure(flow, 1) for flow in cpu])
         np.testing.assert_allclose(values[:, 0], expected_initial, rtol=1e-11, atol=1e-12)
 
+    def test_model_and_covariant_flows_share_unchanged_initial_states(self):
+        from cpn_gf.online_flow import flow_observables
+
+        z, a, s = self._states(batch=3, L=4)
+        z_tensor = torch.as_tensor(z, device=self.device)
+        a_tensor = torch.as_tensor(a, device=self.device)
+        s_tensor = torch.as_tensor(s, device=self.device)
+        z_before, a_before, s_before = (z_tensor.clone(), a_tensor.clone(), s_tensor.clone())
+        model = {"N": 2, "beta": 1.15, "beta1": -0.15,
+                 "alpha": 0.35, "alpha1": 0.22, "mod": 1}
+        flow_cfg = {"epsilon": 0.002, "mass_a": 1.0, "mass_z": 1.0}
+        model_values, _, _ = flow_observables(
+            z_tensor, a_tensor, s_tensor, model, flow_cfg,
+            np.asarray([0, 1]), self.device, "model")
+        covariant_values, _, _ = flow_observables(
+            z_tensor, a_tensor, s_tensor, model, flow_cfg,
+            np.asarray([0, 1]), self.device, "covariant")
+
+        np.testing.assert_allclose(model_values[:, 0, 1:],
+                                   covariant_values[:, 0, 1:], rtol=0, atol=0)
+        torch.testing.assert_close(z_tensor, z_before)
+        torch.testing.assert_close(a_tensor, a_before)
+        torch.testing.assert_close(s_tensor, s_before)
+
 
 if __name__ == "__main__":
     unittest.main()

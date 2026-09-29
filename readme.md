@@ -14,6 +14,37 @@ Copy `experiment.example.toml`, edit it, then run:
 python -m cpn_gf run --config experiment.toml
 ```
 
+The `run` command creates a directory named from a timestamp and configuration
+hash below `output.root` (normally `runs/`). To use a shorter, recognizable
+experiment name instead, create the experiment directory yourself, place the
+configuration in it under the exact name `config.toml`, and start it by
+resuming the directory:
+
+```powershell
+mkdir runs/N2_continuum
+Copy-Item experiment.toml runs/N2_continuum/config.toml
+python -m cpn_gf resume --run runs/N2_continuum
+```
+
+On Bash, the equivalent copy command is:
+
+```bash
+mkdir -p runs/N2_continuum
+cp experiment.toml runs/N2_continuum/config.toml
+python -m cpn_gf resume --run runs/N2_continuum
+```
+
+Here `resume --run` takes the containing directory, not the TOML filename. A
+directory containing `config.toml` but no `manifest.json` is treated as an
+experiment: the configured `mul_*` child directories are created and started
+automatically. Do not pass the general `runs/` directory itself.
+
+Select one or both flow definitions with `flow.kinds`. For a paired comparison
+that samples each production configuration only once, use
+`kinds = ["model", "covariant"]`. The flows run sequentially from identical
+unflowed states, so peak VRAM remains close to a single-flow run while flow
+compute time is approximately additive.
+
 To scan a broad `mul` range cheaply before choosing production points, run only
 the pilots:
 
@@ -59,8 +90,30 @@ To add parameter points to an existing experiment, edit only the experiment-leve
 are run afterward, and completed values are skipped. Each `mul_*` directory keeps
 an automatically managed frozen config for exact restart and provenance; do not
 edit those copies. Settings other than `model.mul`, `[analysis]`, and the
-documented resumable sampling settings below must remain unchanged within one
-experiment directory.
+documented `hmc.chains` and resumable sampling settings below must remain
+unchanged within one experiment directory.
+
+The resume-adjustable settings are grouped at the top of
+`experiment.example.toml`. Their experiment-level behavior is:
+
+- `model.mul`: add values to create new runs. Removing a value excludes that
+  child from later experiment-level resume and analysis but does not delete it.
+- `hmc.chains`: existing children retain their frozen chain count; only newly
+  created `mul` runs use the new value.
+- `sampling.convergence_batch_total_samples`: unfinished and new runs use the
+  new convergence-check interval.
+- `sampling.relative_error`: unfinished and new runs use the new target. A
+  tighter target may resume a completed run subject to the checkpoint and
+  sample-budget requirements described below.
+- `analysis.min_t_over_a2_for_fit`: unfinished runs use the new analysis and
+  online-stopping threshold and restart their consecutive-convergence count.
+
+Changing other model, lattice, HMC, sampling, flow, compute, or output settings
+after a child exists is rejected before expensive work begins. Use a new
+experiment directory for such changes. Editing a `mul_*/config.toml` directly
+is also unsupported and normally causes `configuration does not match this
+run` when its checkpoint is restored. Keeping a backup of an experiment root
+configuration before editing it is recommended.
 
 Rebuild results and plots for one `mul` or a whole experiment with:
 
@@ -73,8 +126,8 @@ experiment root `config.toml`; extra `mul_*` directories are ignored. The
 command displays progress while loading flow chunks, computing the per-chain
 jackknife estimates, and building the continuum fits.
 
-Each completed production run already writes its own `results.json` and
-`results.npz`. To reuse those files and rebuild only the experiment-level
+Each completed production run writes one `results/<kind>.json` and
+`results/<kind>.npz` pair for every configured flow kind. To reuse those files and rebuild only the experiment-level
 summaries and plots, run:
 
 ```powershell
@@ -95,9 +148,9 @@ t<E(t)> = c0 + c1/xi^2 + c2/xi^4
 ```
 
 with at least four eligible `mul` points; `c0` is the continuum value. The
-numeric fits are written to `continuum_fits.json`, the fixed-`rho` fit plots to
-`plots/continuum/`, and the overlay of all configured `mul` curves to
-`plots/tE_action_vs_rho_by_mul.png`. That overlay also shows the fitted
+numeric fits are written to `continuum_fits/<kind>.json`, the fixed-`rho` fit plots to
+`plots/<kind>/continuum/`, and the overlay of all configured `mul` curves to
+`plots/<kind>/tE_action_vs_rho_by_mul.png`. That overlay also shows the fitted
 continuum values and their errors at every `rho` with enough eligible points.
 
 `analysis.min_t_over_a2_for_fit` controls the minimum lattice flow time used
@@ -165,14 +218,16 @@ resume reports all runs that fail either requirement before starting any work.
    leave-one-chain-out `xi`, autocorrelation time, and the flow sampling interval.
 4. The configured chains continue in production. Selected states accumulate only in a
    GPU-memory buffer (typically 384 configurations at L<=64 or 128 at L<=128),
-   then flow as one batch. Only `E_action`, `S00`, `S10`, `S01`, and `Q_z` are
-   written; buffered configurations never reach disk.
-5. Sampling continues until every requested rho has the configured relative
-   error in `tE_action`, or the maximum sample count is reached.
+   then each configured flow kind runs sequentially from the same states. Only
+   `E_action`, `S00`, `S10`, `S01`, `Q_z`, and `Q_U` are written; buffered
+   configurations never reach disk.
+5. Sampling continues until every requested rho for every configured flow kind has
+   the configured relative error in `tE_action`, or the maximum sample count is reached.
 
 Outputs live below `runs/`. Each `mul` directory contains `manifest.json`,
-`scale.npz`, atomically committed `observations/flow_*.npz`, `results.npz`, a
-small restart checkpoint, and plots. Existing `gf_data/`, `gf_results/`, and
+`scale.npz`, atomically committed `observations/flow_*.npz`, per-kind results, a
+small restart checkpoint, and plots. A dual-flow chunk is committed only after
+both results succeed, retaining exact chain/sample alignment. Existing `gf_data/`, `gf_results/`, and
 `gf_plots/` are not modified or deleted.
 
 All sample budgets in the example TOML are totals across chains. The program

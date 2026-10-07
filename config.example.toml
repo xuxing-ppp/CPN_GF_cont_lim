@@ -11,7 +11,9 @@
 
 # 可添加新值；已有值继续或跳过，新值建立独立 run。删除值不会删除原目录。
 model.mul = [0.9, 0.95, 1.0, 1.05, 1.1, 1.15]
-# 已有 mul 沿用其冻结的 chains；此值只用于尚未创建的新 mul。
+# 整数用于所有 mul；也可填与 model.mul 等长的数组，按顺序对应。
+# 例如 hmc.chains = [64, 64, 32, 32, 16, 16]。
+# 新 mul 和仅完成 pilot 的 mul 使用新值；生产热化开始后 chains 冻结。
 hmc.chains = 64
 # 未完成 run 每新增约多少个 flow 构型检查一次误差。
 sampling.convergence_batch_total_samples = 2000
@@ -28,10 +30,10 @@ analysis.min_t_over_a2_for_fit = 2.0
 # CP(N-1) 中的 N；z 在每个格点有 N 个复分量。N 越大越耗时、耗显存。
 model.N = 2
 # 若 normalize=true，四个裸耦合会先同时除以 beta+beta1，再乘 mul。
-model.beta = 1.25
-model.beta1 = -0.999
+model.beta = 1.227
+model.beta1 = -0.969
 model.alpha = 0.0
-model.alpha1 = 0.131
+model.alpha1 = 0.138
 # beta1 改进项形式；beta1=0 时自动使用 mod=0，此值会被忽略。
 model.mod = 1
 # 是否令 beta+beta1=1。目录和 manifest 同时记录归一化前后参数。
@@ -55,7 +57,7 @@ lattice.pilot_warmup = 500
 lattice.pilot_total_samples = 10000
 
 # --- hmc ---
-# 可用 `python -m cpn_gf recommend-chains --config <配置> --pilot` 实测 chains。
+# 可用 `python -m cpn_gf recommend-chains --run <实验目录>` 实测各 mul 的 chains。
 # 正式格点开始 scale-setting 前，每条链的热化/自动调参 trajectory 数。
 hmc.warmup = 1000
 # dual averaging 的目标 HMC 接受率；生产期冻结调好的 step size。

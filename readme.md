@@ -1,253 +1,118 @@
-# CPN Gradient Flow: batched HMC and online flow
+# CPN Gradient Flow
 
-This repository uses one PyTorch implementation for CPU and CUDA. Every
-parameter set is sampled with constrained HMC; heatbath is retained only as a
-legacy statistical reference. Production configurations are flowed immediately
-and are never archived. The only full configuration on disk is the latest
-atomic restart checkpoint.
+## Common commands
 
-## Quick start
-
-Copy `experiment.example.toml`, edit it, then run:
-
-```powershell
-python -m cpn_gf run --config experiment.toml
-```
-
-The `run` command creates a directory named from a timestamp and configuration
-hash below `output.root` (normally `runs/`). To use a shorter, recognizable
-experiment name instead, create the experiment directory yourself, place the
-configuration in it under the exact name `config.toml`, and start it by
-resuming the directory:
-
-```powershell
-mkdir runs/N2_continuum
-Copy-Item experiment.toml runs/N2_continuum/config.toml
-python -m cpn_gf resume --run runs/N2_continuum
-```
-
-On Bash, the equivalent copy command is:
+Copy `config.example.toml` to `config.toml`, edit it, and run from the repository root:
+If using the provided conda setup, activate it first with `conda activate pytorch`.
 
 ```bash
-mkdir -p runs/N2_continuum
-cp experiment.toml runs/N2_continuum/config.toml
-python -m cpn_gf resume --run runs/N2_continuum
-```
-
-Here `resume --run` takes the containing directory, not the TOML filename. A
-directory containing `config.toml` but no `manifest.json` is treated as an
-experiment: the configured `mul_*` child directories are created and started
-automatically. Do not pass the general `runs/` directory itself.
-
-Select one or both flow definitions with `flow.kinds`. For a paired comparison
-that samples each production configuration only once, use
-`kinds = ["model", "covariant"]`. The flows run sequentially from identical
-unflowed states, so peak VRAM remains close to a single-flow run while flow
-compute time is approximately additive.
-
-To scan a broad `mul` range cheaply before choosing production points, run only
-the pilots:
-
-```powershell
-python -m cpn_gf pilot --config experiment.toml
-```
-
-The experiment directory receives `pilot_results.json` and
-`pilot_results.csv`, containing each `mul`, its pilot xi and jackknife error,
-the recommended lattice size, and the production lattice size. Edit only that
-experiment's root `config.toml` so `model.mul` contains the points selected for
-production, then continue with:
-
-```powershell
+python -m cpn_gf run --config config.toml
+python -m cpn_gf pilot --config config.toml
+python -m cpn_gf recommend-chains --run runs/<experiment>
 python -m cpn_gf resume --run runs/<experiment>
-```
-
-The selected runs reuse their pilot scale estimates and begin independent
-production warmup; unselected pilot directories remain available. Adding more
-values to the root config later and running
-`python -m cpn_gf pilot --run runs/<experiment>` fills in their pilots without
-advancing existing runs into production. A failed pilot is recorded in both
-the manifest and summary and stops the scan; remove that value or rerun the
-pilot command to retry it.
-
-Resume one interrupted `mul` run with:
-
-```powershell
-python -m cpn_gf resume --run runs/<experiment>/mul_<value>
-```
-
-Or pass the experiment directory to finish the complete `mul` list from its
-`config.toml`. Completed runs are skipped, an interrupted run is restored, and
-not-yet-created later runs are started automatically:
-
-```powershell
-python -m cpn_gf resume --run runs/<experiment>
-```
-
-To add parameter points to an existing experiment, edit only the experiment-level
-`config.toml` and add, insert, or reorder values in `model.mul`, then run the same
-`resume` command. Existing interrupted runs are resumed first, newly added values
-are run afterward, and completed values are skipped. Each `mul_*` directory keeps
-an automatically managed frozen config for exact restart and provenance; do not
-edit those copies. Settings other than `model.mul`, `[analysis]`, and the
-documented `hmc.chains` and resumable sampling settings below must remain
-unchanged within one experiment directory.
-
-The resume-adjustable settings are grouped at the top of
-`experiment.example.toml`. Their experiment-level behavior is:
-
-- `model.mul`: add values to create new runs. Removing a value excludes that
-  child from later experiment-level resume and analysis but does not delete it.
-- `hmc.chains`: existing children retain their frozen chain count; only newly
-  created `mul` runs use the new value.
-- `sampling.convergence_batch_total_samples`: unfinished and new runs use the
-  new convergence-check interval.
-- `sampling.relative_error`: unfinished and new runs use the new target. A
-  tighter target may resume a completed run subject to the checkpoint and
-  sample-budget requirements described below.
-- `analysis.min_t_over_a2_for_fit`: unfinished runs use the new analysis and
-  online-stopping threshold and restart their consecutive-convergence count.
-
-Changing other model, lattice, HMC, sampling, flow, compute, or output settings
-after a child exists is rejected before expensive work begins. Use a new
-experiment directory for such changes. Editing a `mul_*/config.toml` directly
-is also unsupported and normally causes `configuration does not match this
-run` when its checkpoint is restored. Keeping a backup of an experiment root
-configuration before editing it is recommended.
-
-Rebuild results and plots for one `mul` or a whole experiment with:
-
-```powershell
 python -m cpn_gf analyze --run runs/<experiment>
 ```
 
-Experiment-level analysis considers only the `model.mul` values listed in the
-experiment root `config.toml`; extra `mul_*` directories are ignored. The
-command displays progress while loading flow chunks, computing the per-chain
-jackknife estimates, and building the continuum fits.
+`run` creates a timestamped experiment under `output.root`. `pilot --config`
+creates an experiment with only scale-selection pilots. Both print its path.
+For a named experiment, create `runs/my_experiment/` and put your configuration
+there as `config.toml`. Run `recommend-chains --run runs/my_experiment`, copy its
+final `hmc.chains = [...]` into that root config, then run `resume` to start
+production. Missing pilots are saved and existing pilots are reused.
 
-Each completed production run writes one `results/<kind>.json` and
-`results/<kind>.npz` pair for every configured flow kind. To reuse those files and rebuild only the experiment-level
-summaries and plots, run:
+`--run` takes a directory, not a TOML file or the general `runs/` directory.
+Resume and analyze also accept an individual `mul_*` directory. Use
+`pilot --run runs/<experiment>` to fill in missing or failed pilots, or
+`analyze --run runs/<experiment> --aggregate-only` to rebuild experiment plots
+and summaries using existing per-mul JSON/NPZ results.
 
-```powershell
-python -m cpn_gf analyze --run runs/<experiment> --aggregate-only
+## Configuration and restart
+
+`hmc.chains` accepts an integer for all mul values or an integer array matching
+`model.mul` in length and order. Every count must be at least 2:
+
+```toml
+model.mul = [0.8, 1.0, 1.2]
+hmc.chains = [64, 32, 16]
 ```
 
-This mode does not read the flow chunks, repeat the per-`mul` jackknife
-analysis, or rebuild the individual `mul` plots. It requires both result files
-for every configured production run and reports any that are missing. The CLI
-prints only a compact completion summary and output paths; complete numerical
-results remain in the JSON and NPZ files.
+Update the chains array when adding, removing, or reordering mul values. Removing
+a mul excludes its directory from experiment resume and analysis without deleting
+it. Edit only the experiment root `config.toml`; child configs are managed
+automatically. New children and children with only a completed pilot use the
+latest root chains. Once production warmup starts, chains remain frozen for
+exact checkpoint/RNG restoration. Resume handles interrupted children first,
+starts missing children, and skips completed children.
 
-At each fixed `rho=t/xi^2`, continuum extrapolation uses an error-in-both-axes
-quadratic fit
+Other root settings that can be changed on resume:
 
-```text
-t<E(t)> = c0 + c1/xi^2 + c2/xi^4
-```
+- `sampling.convergence_batch_total_samples`: convergence-check interval.
+- `sampling.relative_error`: stopping target; resets convergence streaks.
+  Tightening it can reopen completed runs if the final checkpoint and unused
+  maximum sample budget remain. These requirements are checked before work starts.
+- `analysis.min_t_over_a2_for_fit`: flow-time threshold for fits and online
+  stopping; resets convergence streaks.
 
-with at least four eligible `mul` points; `c0` is the continuum value. The
-numeric fits are written to `continuum_fits/<kind>.json`, the fixed-`rho` fit plots to
-`plots/<kind>/continuum/`, and the overlay of all configured `mul` curves to
-`plots/<kind>/tE_action_vs_rho_by_mul.png`. That overlay also shows the fitted
-continuum values and their errors at every `rho` with enough eligible points.
+Other model, lattice, HMC, sampling, flow, compute, and output settings must
+remain unchanged after a child is created. Use a new experiment for changes.
 
-`analysis.min_t_over_a2_for_fit` controls the minimum lattice flow time used
-by continuum fits and by the online relative-error stopping test. The flow
-progress bar reports the largest included relative error and its `t/a^2` at
-each convergence check. Smaller-flow-time points are still stored and remain
-visible as excluded points in the plot. Changing this option does not
-invalidate a checkpoint; unfinished runs use the latest experiment-level
-value and restart their consecutive-convergence count.
+## Pilots and chain recommendations
 
-Set `compute.device = "cpu"` for CPU. Production calculations use
-`float64/complex128` on both devices. `lattice.L = 0` enables the pilot that
-chooses `L`; a positive value uses that lattice size directly. The pilot starts
-at `lattice.L0`. If its central estimate does not satisfy
-`L0 / xi >= lattice.target_L0_over_xi`, it reruns on a larger trial lattice up
-to `lattice.max_L0`. Omitting `max_L0` makes it equal to `L0`, preserving the
-single-attempt behavior of older configurations.
+`lattice.L = 0` selects production size from each mul's pilot; a positive value
+fixes production size. Pilots start at `L0` and increase it until the central
+estimate satisfies `L0/xi >= target_L0_over_xi`, bounded by `max_L0`.
+Omitting `max_L0` makes it equal to `L0`.
 
-## Choosing the chain count
+Pilots measure structure modes only. Results and actual pilot chains are saved
+in child manifests and experiment-level `pilot_results.json`/`.csv`. Failed
+pilots can be retried. Scan broadly with `pilot`, select mul values in the root
+config, and `resume` to reuse their estimates with independent production warmup.
 
-Measure the current machine instead of guessing a chain count. For a known
-production lattice size, run:
+`recommend-chains` benchmarks each mul at its own production size. Automatic
+size completes missing pilots; fixed size needs no pilot. CUDA pilot OOM retries
+halve chains down to 2. The benchmark searches powers of two, selecting the
+smallest candidate within 95% of best measured HMC throughput that meets the
+VRAM budget and flow feasibility check. It stops after two consecutive gains
+below 5%, OOM, or the memory limit. `--max-chains N` sets the ceiling (default
+1024). Details are saved incrementally in `chains_recommendations.json`.
+Rerunning benchmarks the current machine again. Root TOML and production
+checkpoints are never changed by this command.
 
-```powershell
-python -m cpn_gf recommend-chains --config experiment.toml --lattice-size 72
-```
+## Sampling, storage, and analysis
 
-If `lattice.L=0`, the command can temporarily pilot only the largest configured
-`mul` and benchmark its recommended lattice size:
+CPU and CUDA share PyTorch HMC with production `float64/complex128`; set
+`compute.device = "cpu"` for CPU. Production warmup tunes the step size, then
+scale setting measures `S00/S10/S01`, pooled and leave-one-chain-out xi,
+autocorrelation time, and the flow sampling interval. Flow targets are then fixed.
 
-```powershell
-python -m cpn_gf recommend-chains --config experiment.toml --pilot
-```
+Sample budgets are totals across chains, rounded upward for equal chain lengths.
+Full z/a/s histories are never archived. Configurations may be buffered within
+one transactional flow chunk; only the atomic current checkpoint stores full
+configurations. Chunks retain chain identity and named `E_action`, `S00`, `S10`,
+`S01`, `Q_z`, and `Q_U`. Second-moment xi comes from pooled structure means,
+never averaged per configuration. With `alpha=0`, s is absent throughout;
+otherwise `Q_s` is stored only as an unflowed observable.
 
-The temporary pilot and benchmark do not create a run or edit the TOML. The
-reported recommendation is the smallest power-of-two chain count within 95%
-of the best measured throughput and within `compute.max_vram_fraction`. Use
-`--max-chains N` to change the default search limit of 1024.
+`flow.kinds = ["model", "covariant"]` runs paired flows sequentially from the
+same sampled states, committing a chunk only after both succeed. Sampling stops
+when every included rho in every kind meets the relative error target in tE,
+or the maximum sample budget is reached.
 
-An experiment may contain different chain counts for different `mul` values.
-To change the count for later values, edit only the experiment-level
-`config.toml`, add the new `mul` values if needed, and run `resume` on the
-experiment directory. Existing incomplete runs resume from their frozen child
-config and checkpoint with their original count; newly created runs use the
-new count. Never edit a `mul_*` child config to change an existing run's chain
-count.
-
-`sampling.convergence_batch_total_samples` may also be changed in the
-experiment-level `config.toml`. Completed `mul` runs remain untouched, while
-incomplete and newly created runs use the new convergence-check batch size.
-
-`sampling.relative_error` may be changed there as well. Incomplete and newly
-created runs use the new target and restart their consecutive-convergence count.
-Completed runs are left untouched when the target is unchanged or relaxed. When
-the target is tightened, a completed run resumes production from its final
-checkpoint and accumulates fresh convergence checks. This requires
-`output.keep_final_checkpoint=true` and unused `flow_max_total_samples` capacity;
-resume reports all runs that fail either requirement before starting any work.
-
-## Run phases
-
-1. A pilot estimates the correlation length and chooses the production volume.
-2. HMC warmup tunes the step size to the requested acceptance probability.
-3. Scale setting measures only `S00/S10/S01` to determine pooled and
-   leave-one-chain-out `xi`, autocorrelation time, and the flow sampling interval.
-4. The configured chains continue in production. Selected states accumulate only in a
-   GPU-memory buffer (typically 384 configurations at L<=64 or 128 at L<=128),
-   then each configured flow kind runs sequentially from the same states. Only
-   `E_action`, `S00`, `S10`, `S01`, `Q_z`, and `Q_U` are written; buffered
-   configurations never reach disk.
-5. Sampling continues until every requested rho for every configured flow kind has
-   the configured relative error in `tE_action`, or the maximum sample count is reached.
-
-Outputs live below `runs/`. Each `mul` directory contains `manifest.json`,
-`scale.npz`, atomically committed `observations/flow_*.npz`, per-kind results, a
-small restart checkpoint, and plots. A dual-flow chunk is committed only after
-both results succeed, retaining exact chain/sample alignment. Existing `gf_data/`, `gf_results/`, and
-`gf_plots/` are not modified or deleted.
-
-All sample budgets in the example TOML are totals across chains. The program
-rounds them upward so every chain remains the same length. When `alpha=0`, the
-integer plaquette field `s` is not allocated, updated, checkpointed, or flowed.
-
-Production results are separated into unflowed and flowed observables. The
-unflowed block contains `chi_m`, pooled `xi`, and connected susceptibilities for
-`Q_z`, `Q_U`, and (only when alpha is nonzero) `Q_s`. The flowed block contains
-`tE`, `chi_m`, pooled `xi`, and connected susceptibilities for `Q_z` and `Q_U`;
-`Q_s` is not repeated because fixed-s flow leaves it unchanged.
+Children contain manifests, scale statistics, observation chunks, checkpoints,
+per-kind results and plots. At fixed rho, at least four eligible mul points are
+needed for the error-in-both-axes fit `t<E(t)> = c0 + c1/xi^2 + c2/xi^4`.
+Experiment outputs are under `analysis/`, `continuum_fits/`, and `plots/`.
+The analysis threshold excludes small flow times from fitting and stopping but
+preserves their stored data and plots. Legacy `gf_data/`, `gf_results/`,
+`gf_plots/`, and scripts below `legacy/` remain untouched.
 
 ## Verification
 
-```powershell
+```bash
 python -m unittest discover -s tests -p "test_*.py"
 python tests/benchmark_cuda_hmc.py
 python tests/benchmark_cuda_flow.py
 ```
 
-Tests cover NumPy/Torch action and force parity for both model modes,
-constraint preservation, exact checkpoint/RNG restoration, flow parity, online
-analysis, and a complete small CPU run.
+Tests cover action/force parity, constraints and reversibility, exact restart,
+flow monotonicity/parity, online analysis, and a small complete CPU run.

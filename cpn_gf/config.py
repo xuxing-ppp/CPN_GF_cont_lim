@@ -51,7 +51,13 @@ def validate(cfg):
         raise ValueError("production runs require compute.dtype='float64'")
     if int(cfg["model"]["N"]) <= 1:
         raise ValueError("model.N must be greater than one")
-    if int(cfg["hmc"]["chains"]) < 2:
+    chains = cfg["hmc"]["chains"]
+    counts = chains if isinstance(chains, list) else [chains]
+    if isinstance(chains, list) and len(chains) != len(cfg["model"]["mul"]):
+        raise ValueError("hmc.chains array must match model.mul length")
+    if not counts or any(type(count) is not int for count in counts):
+        raise TypeError("hmc.chains must be an integer or an array of integers")
+    if any(count < 2 for count in counts):
         raise ValueError("at least two independent HMC chains are required")
     lat = cfg["lattice"]
     try:
@@ -126,6 +132,32 @@ def load_config(path):
     _merge(cfg, supplied)
     cfg["_source"] = str(path.resolve())
     return validate(cfg)
+
+
+def config_for_mul(cfg, mul):
+    """Resolve positional experiment chain counts without mutating the source."""
+    result = deepcopy(cfg)
+    counts = result["hmc"]["chains"]
+    if isinstance(counts, list):
+        index = [float(value) for value in result["model"]["mul"]].index(float(mul))
+        result["hmc"]["chains"] = counts[index]
+    return result
+
+
+def write_config(path, cfg):
+    """Atomically write a resolved child config using TOML-compatible JSON values."""
+    path = Path(path)
+    lines = []
+    for section, values in cfg.items():
+        if section.startswith("_"):
+            continue
+        lines.append(f"[{section}]")
+        lines.extend(f"{key} = {json.dumps(value, allow_nan=False, ensure_ascii=False)}"
+                     for key, value in values.items() if value is not None)
+        lines.append("")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text("\n".join(lines), encoding="utf-8")
+    temporary.replace(path)
 
 
 def canonical(cfg):

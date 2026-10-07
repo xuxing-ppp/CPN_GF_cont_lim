@@ -15,8 +15,8 @@ import torch
 from tqdm import tqdm
 
 from .analysis import analyze_run
-from .config import (fingerprint, load_config, mul_directory_name,
-                     run_family_fingerprint, scaled_model)
+from .config import (config_for_mul, fingerprint, load_config, mul_directory_name,
+                     run_family_fingerprint, scaled_model, write_config)
 from .hmc import BatchedHMC, tune
 from .io import atomic_json, atomic_npz, atomic_torch, load_checkpoint
 from .online_flow import flow_observables
@@ -99,7 +99,7 @@ def _run_pilot(cfg, model, seed):
     return {"xi": float(xi), "xi_error": xi_error, "tau_max": float(tau),
             "L0": current_L0, "L": L, "recommended_L": L,
             "step_size": float(engine.step_size), "samples_per_chain": per_chain,
-            "total_samples": per_chain * chains, "attempt_count": len(attempts),
+            "total_samples": per_chain * chains, "chains": chains, "attempt_count": len(attempts),
             "attempts": attempts}
 
 
@@ -156,9 +156,20 @@ def _start_after_pilot(cfg, run_dir, manifest):
     return _finish_scale(cfg, run_dir, engine, manifest)
 
 
-def _prepare_pilot(cfg, model, run_dir, seed):
+def _prepare_pilot(cfg, model, run_dir, seed, retry_oom=False):
     """Run and persist only the scale-selection pilot."""
-    pilot = _run_pilot(cfg, model, seed + 1)
+    probe = deepcopy(cfg)
+    while True:
+        try:
+            pilot = _run_pilot(probe, model, seed + 1)
+            pilot["chains"] = probe["hmc"]["chains"]
+            break
+        except torch.cuda.OutOfMemoryError:
+            if not retry_oom or probe["hmc"]["chains"] <= 2:
+                raise
+            probe["hmc"]["chains"] = max(2, probe["hmc"]["chains"] // 2)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     fixed_L = int(cfg["lattice"].get("L", 0))
     production_L = fixed_L if fixed_L > 0 else int(pilot["recommended_L"])
     manifest = _base_manifest(cfg, model, run_dir, pilot, production_L, seed,
@@ -430,6 +441,7 @@ def _pilot_summary_row(manifest):
     pilot = manifest.get("pilot") or {}
     return {"mul": manifest.get("model", {}).get("mul"),
             "status": manifest.get("status"),
+            "chains": pilot.get("chains"),
             "xi": pilot.get("xi"), "xi_error": pilot.get("xi_error"),
             "tau_max": pilot.get("tau_max"), "L0": pilot.get("L0"),
             "recommended_L": pilot.get("recommended_L", pilot.get("L")),
@@ -456,7 +468,7 @@ def _write_pilot_summary(experiment_dir):
     atomic_json(Path(experiment_dir) / "pilot_results.json", payload)
     csv_path = Path(experiment_dir) / "pilot_results.csv"
     tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
-    fields = ("mul", "status", "xi", "xi_error", "tau_max", "L0", "recommended_L",
+    fields = ("mul", "status", "chains", "xi", "xi_error", "tau_max", "L0", "recommended_L",
               "production_L", "step_size", "samples_per_chain", "total_samples",
               "attempt_count", "error")
     with tmp.open("w", encoding="utf-8", newline="") as fh:
@@ -477,7 +489,7 @@ def pilot_config(config_path):
         raise RuntimeError(f"pilot failed in {experiment}: {exc}") from exc
 
 
-def pilot_experiment(experiment_dir):
+def pilot_experiment(experiment_dir, retry_oom=False):
     """Run missing or previously failed pilots in an experiment."""
     experiment_dir = Path(experiment_dir)
     root_cfg = load_config(experiment_dir / "config.toml")
@@ -486,7 +498,7 @@ def pilot_experiment(experiment_dir):
         mul = float(mul)
         run_dir = experiment_dir / mul_directory_name(mul)
         manifest_path = run_dir / "manifest.json"
-        cfg = root_cfg
+        cfg = config_for_mul(root_cfg, mul)
         manifest = None
         child_config = run_dir / "config.toml"
         if child_config.is_file():
@@ -508,18 +520,18 @@ def pilot_experiment(experiment_dir):
             outputs.append({"mul": mul, "status": manifest.get("status", "existing"),
                             "action": "skipped", "pilot": manifest.get("pilot")})
         else:
+            cfg["hmc"]["chains"] = config_for_mul(root_cfg, mul)["hmc"]["chains"]
             pending.append((mul, run_dir, cfg))
 
     for mul, run_dir, cfg in pending:
         run_dir.mkdir(exist_ok=True)
         config_copy = run_dir / "config.toml"
-        if not config_copy.exists():
-            shutil.copy2(experiment_dir / "config.toml", config_copy)
-            cfg = root_cfg
+        write_config(config_copy, cfg)
         model = scaled_model(cfg, mul)
         seed = _run_seed(cfg, mul)
         try:
-            manifest = _prepare_pilot(cfg, model, run_dir, seed)
+            manifest = (_prepare_pilot(cfg, model, run_dir, seed, retry_oom=True)
+                        if retry_oom else _prepare_pilot(cfg, model, run_dir, seed))
         except Exception as exc:
             fixed_L = int(cfg["lattice"].get("L", 0))
             manifest = _base_manifest(
@@ -541,14 +553,15 @@ def run_config(config_path):
     cfg, experiment = _create_experiment(config_path)
     outputs = []
     for mul in cfg["model"]["mul"]:
-        model = scaled_model(cfg, float(mul))
+        child_cfg = config_for_mul(cfg, mul)
+        model = scaled_model(child_cfg, float(mul))
         run_dir = experiment / mul_directory_name(mul)
         run_dir.mkdir()
-        shutil.copy2(config_path, run_dir / "config.toml")
+        write_config(run_dir / "config.toml", child_cfg)
         try:
             engine, manifest, samples, chunks, streak = _prepare_new(
-                cfg, model, run_dir, _run_seed(cfg, mul))
-            outputs.append(_production(cfg, run_dir, engine, manifest, samples, chunks, streak))
+                child_cfg, model, run_dir, _run_seed(child_cfg, mul))
+            outputs.append(_production(child_cfg, run_dir, engine, manifest, samples, chunks, streak))
         except Exception as exc:
             path = run_dir / "manifest.json"
             manifest = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
@@ -602,6 +615,10 @@ def resume_experiment(experiment_dir):
             child_cfg["sampling"]["convergence_batch_total_samples"] = int(
                 root_cfg["sampling"]["convergence_batch_total_samples"])
             child_cfg["sampling"]["relative_error"] = current_relative_error
+            if manifest.get("phase") == "pilot_complete":
+                if (run_dir / "checkpoint.pt").exists():
+                    raise RuntimeError(f"{run_dir}: pilot_complete has a production checkpoint")
+                child_cfg["hmc"]["chains"] = config_for_mul(root_cfg, mul)["hmc"]["chains"]
             if manifest.get("phase") == "complete":
                 if current_relative_error < previous_relative_error:
                     checkpoint_path = run_dir / "checkpoint.pt"
@@ -640,6 +657,11 @@ def resume_experiment(experiment_dir):
 
     for mul, run_dir, manifest_path, manifest, cfg in pending:
         try:
+            if manifest.get("phase") == "pilot_complete":
+                write_config(run_dir / "config.toml", cfg)
+                manifest.update(chains=cfg["hmc"]["chains"], hmc=cfg["hmc"],
+                                config_fingerprint=fingerprint(cfg))
+                atomic_json(manifest_path, manifest)
             engine, manifest, samples, chunks, streak = _restore(cfg, run_dir)
             finished = _production(cfg, run_dir, engine, manifest, samples, chunks, streak)
             outputs.append({"mul": mul, "status": finished["status"], "action": "resumed"})
@@ -649,7 +671,7 @@ def resume_experiment(experiment_dir):
             raise
 
     for mul, run_dir in missing:
-        cfg = root_cfg
+        cfg = config_for_mul(root_cfg, mul)
         model = scaled_model(cfg, mul)
         run_dir.mkdir(exist_ok=True)
         config_copy = run_dir / "config.toml"
@@ -664,9 +686,11 @@ def resume_experiment(experiment_dir):
                 root_cfg["sampling"]["convergence_batch_total_samples"])
             cfg["sampling"]["relative_error"] = float(
                 root_cfg["sampling"]["relative_error"])
+            cfg["hmc"]["chains"] = config_for_mul(root_cfg, mul)["hmc"]["chains"]
+            write_config(config_copy, cfg)
             model = scaled_model(cfg, mul)
         else:
-            shutil.copy2(experiment_dir / "config.toml", config_copy)
+            write_config(config_copy, cfg)
         try:
             engine, manifest, samples, chunks, streak = _prepare_new(
                 cfg, model, run_dir, _run_seed(cfg, mul))

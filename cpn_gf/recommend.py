@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import gc
+import json
 import math
 import time
-from copy import deepcopy
+from pathlib import Path
 
 import numpy as np
 import torch
 
-from .config import load_config, scaled_model
+from .config import (config_for_mul, load_config, mul_directory_name,
+                     run_family_fingerprint, scaled_model)
+from .io import atomic_json
 from .hmc import BatchedHMC
 from .online_flow import flow_observables
-from .runner import _device, _run_pilot
+from .runner import _device, pilot_experiment
 
 
 def _cuda_budget(device, fraction):
@@ -22,31 +25,16 @@ def _cuda_budget(device, fraction):
     return min(int(props.total_memory * fraction), int(free * 0.80))
 
 
-def _temporary_pilot(cfg):
-    """Pilot only the largest mul, retrying with fewer chains after CUDA OOM."""
-    mul = max(float(value) for value in cfg["model"]["mul"])
-    probe = deepcopy(cfg)
-    chains = int(probe["hmc"]["chains"])
-    while True:
-        probe["hmc"]["chains"] = chains
-        try:
-            result = _run_pilot(probe, scaled_model(probe, mul), int(cfg["compute"]["seed"]) + 1)
-            return int(result["recommended_L"]), mul, chains, result
-        except torch.cuda.OutOfMemoryError:
-            if chains <= 2:
-                raise
-            chains = max(2, chains // 2)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-
 def _measure_candidate(cfg, model, L, chains, repeats=3, trajectories=3):
     device = _device(cfg)
+    if device.type == "cuda":
+        # Release the preceding candidate's cached allocations before deriving
+        # this candidate's free-memory budget, including across mul values.
+        torch.cuda.empty_cache()
     budget = _cuda_budget(device, float(cfg["compute"]["max_vram_fraction"]))
-    engine = None
+    engine = z = a = s = None
     try:
         if device.type == "cuda":
-            torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(device)
         engine = BatchedHMC(chains, L, model, cfg["hmc"], device,
                             int(cfg["compute"]["seed"]) + chains)
@@ -85,36 +73,66 @@ def _measure_candidate(cfg, model, L, chains, repeats=3, trajectories=3):
         return {"chains": chains, "status": "oom", "rate": None,
                 "peak_bytes": None, "budget_bytes": budget, "flow_micro_batch": None}
     finally:
-        del engine
+        del engine, z, a, s
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
 
-def recommend_chains(config_path, lattice_size=None, run_pilot=False, max_chains=1024):
-    """Benchmark power-of-two chain counts without changing configuration files."""
-    cfg = load_config(config_path)
-    fixed = int(cfg["lattice"]["L"])
-    if lattice_size is not None and run_pilot:
-        raise ValueError("--lattice-size and --pilot are mutually exclusive")
-    pilot = None
-    if lattice_size is not None:
-        L, source = int(lattice_size), "explicit"
-        mul = max(float(value) for value in cfg["model"]["mul"])
-    elif run_pilot:
-        if fixed > 0:
-            raise ValueError("--pilot is unnecessary when lattice.L is fixed")
-        L, mul, pilot_chains, pilot = _temporary_pilot(cfg)
-        source = f"temporary pilot ({pilot_chains} chains)"
-    elif fixed > 0:
-        L, source = fixed, "lattice.L"
-        mul = max(float(value) for value in cfg["model"]["mul"])
-    else:
-        raise ValueError("lattice.L=0; choose --lattice-size L or --pilot")
-    if L <= 0:
-        raise ValueError("lattice size must be positive")
+def recommend_chains(experiment_dir, max_chains=1024):
+    """Persist per-mul recommendations, reusing or completing scale pilots."""
+    directory = Path(experiment_dir)
+    if (directory / "manifest.json").is_file():
+        raise ValueError("recommend-chains requires an experiment directory, not a mul run")
+    cfg = load_config(directory / "config.toml")
     if int(max_chains) < 2:
         raise ValueError("--max-chains must be at least 2")
+    # Validate all existing children before any expensive or mutating work.
+    for mul in cfg["model"]["mul"]:
+        child = directory / mul_directory_name(mul)
+        if (child / "config.toml").exists():
+            frozen = load_config(child / "config.toml")
+            if run_family_fingerprint(frozen) != run_family_fingerprint(cfg):
+                raise ValueError(f"{child}: configuration incompatible with experiment")
+        if (child / "manifest.json").exists():
+            manifest = json.loads((child / "manifest.json").read_text())
+            if float(manifest.get("model", {}).get("mul", float("nan"))) != float(mul):
+                raise ValueError(f"{child}: manifest mul does not match configuration")
+            if not (child / "config.toml").is_file():
+                raise ValueError(f"{child}: missing frozen config.toml")
+            if int(cfg["lattice"]["L"]) == 0 and manifest.get("phase") != "pilot_error":
+                pilot = manifest.get("pilot") or {}
+                try:
+                    valid = (math.isfinite(float(pilot["xi"])) and float(pilot["xi"]) > 0
+                             and int(manifest["L"]) > 0)
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    valid = False
+                if not valid:
+                    raise ValueError(f"{child}: invalid saved pilot")
+    if int(cfg["lattice"]["L"]) == 0:
+        pilot_experiment(directory, retry_oom=True)
+    result = {"experiment": str(directory), "device": cfg["compute"]["device"],
+              "mul": list(cfg["model"]["mul"]), "runs": [], "recommended_chains": []}
+    for mul in cfg["model"]["mul"]:
+        probe = config_for_mul(cfg, mul)
+        L, source, pilot = int(cfg["lattice"]["L"]), "lattice.L", None
+        if L == 0:
+            manifest = json.loads((directory / mul_directory_name(mul) / "manifest.json").read_text())
+            pilot = manifest.get("pilot")
+            if (not pilot or pilot.get("xi") is None
+                    or not math.isfinite(float(pilot["xi"])) or float(pilot["xi"]) <= 0):
+                raise ValueError(f"mul={mul}: invalid saved pilot")
+            L, source = int(manifest["L"]), "saved pilot"
+        if L <= 0:
+            raise ValueError(f"mul={mul}: lattice size must be positive")
+        row = _recommend_mul(probe, float(mul), L, source, pilot, max_chains)
+        result["runs"].append(row)
+        result["recommended_chains"].append(row["recommended_chains"])
+        atomic_json(directory / "chains_recommendations.json", result)
+    return result
+
+
+def _recommend_mul(cfg, mul, L, source, pilot, max_chains):
 
     model = scaled_model(cfg, mul)
     rows, chains, slow_gains = [], 2, 0
@@ -141,6 +159,11 @@ def recommend_chains(config_path, lattice_size=None, run_pilot=False, max_chains
 
 
 def print_recommendation(result):
+    if "runs" in result:
+        for row in result["runs"]:
+            print_recommendation(row)
+        print("hmc.chains = " + json.dumps(result["recommended_chains"]))
+        return
     print(f"device={result['device']}  L={result['L']} ({result['L_source']})  "
           f"mul={result['mul']:g}")
     print("chains  status        chain-trajectories/s  peak MiB  flow micro-batch")

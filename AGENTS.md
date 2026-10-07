@@ -2,7 +2,7 @@
 
 ## Active workflow
 
-- Configure runs with TOML; start with `experiment.example.toml`.
+- Configure runs with TOML; start with `config.example.toml`.
 - Run `python -m cpn_gf run --config <file.toml>` from the repository root.
 - Resume a mul run with `python -m cpn_gf resume --run <run-directory>`.
 - Rebuild results/plots with `python -m cpn_gf analyze --run <mul-or-experiment-directory>`.

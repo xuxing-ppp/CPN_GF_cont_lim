@@ -58,10 +58,7 @@ def main(argv=None):
     analyze.add_argument("--aggregate-only", action="store_true",
                          help="reuse per-mul results and rebuild only experiment summaries")
     recommend = sub.add_parser("recommend-chains", help="benchmark and recommend HMC chains")
-    recommend.add_argument("--config", required=True)
-    size = recommend.add_mutually_exclusive_group()
-    size.add_argument("--lattice-size", type=int)
-    size.add_argument("--pilot", action="store_true")
+    recommend.add_argument("--run", required=True)
     recommend.add_argument("--max-chains", type=int, default=1024)
     args = parser.parse_args(argv)
     if args.command == "run":
@@ -92,8 +89,7 @@ def main(argv=None):
                                 aggregate_only=args.aggregate_only)
     else:
         print_recommendation(recommend_chains(
-            args.config, lattice_size=args.lattice_size,
-            run_pilot=args.pilot, max_chains=args.max_chains))
+            args.run, max_chains=args.max_chains))
 
 
 if __name__ == "__main__":

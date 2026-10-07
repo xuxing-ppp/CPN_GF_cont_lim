@@ -14,7 +14,7 @@ DEFAULTS = {
     "lattice": {"L": 0, "L0": 50, "target_L0_over_xi": 2.0, "max_L0": None,
                 "L_multiple": 6, "minimum_L": 6,
                 "pilot_warmup": 400, "pilot_total_samples": 10000},
-    "hmc": {"chains": 64, "warmup": 2000, "target_accept": 0.8,
+    "hmc": {"chains": 64, "auto_chains": False, "warmup": 2000, "target_accept": 0.8,
             "initial_step_size": 0.01, "trajectory_length": 0.4,
             "trajectory_jitter": 0.1, "mass_a": 1.0, "mass_z": 1.0,
             "s_step": 1.0, "s_updates": 3, "s_max": 100},
@@ -52,6 +52,8 @@ def validate(cfg):
     if int(cfg["model"]["N"]) <= 1:
         raise ValueError("model.N must be greater than one")
     chains = cfg["hmc"]["chains"]
+    if type(cfg["hmc"]["auto_chains"]) is not bool:
+        raise TypeError("hmc.auto_chains must be a boolean")
     counts = chains if isinstance(chains, list) else [chains]
     if isinstance(chains, list) and len(chains) != len(cfg["model"]["mul"]):
         raise ValueError("hmc.chains array must match model.mul length")
@@ -141,6 +143,7 @@ def config_for_mul(cfg, mul):
     if isinstance(counts, list):
         index = [float(value) for value in result["model"]["mul"]].index(float(mul))
         result["hmc"]["chains"] = counts[index]
+    result["model"]["mul"] = [float(mul)]
     return result
 
 
@@ -165,6 +168,9 @@ def canonical(cfg):
     # particular, excluding this table keeps older runs resumable.
     clean = {k: v for k, v in cfg.items()
              if not k.startswith("_") and k != "analysis"}
+    clean = deepcopy(clean)
+    # A preparation-only switch must not change old checkpoint fingerprints.
+    clean["hmc"].pop("auto_chains", None)
     return json.dumps(clean, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
@@ -182,6 +188,7 @@ def run_family_fingerprint(cfg):
     # children keep their frozen value while newly added mul values may use a
     # new experiment-level value.
     clean["hmc"].pop("chains", None)
+    clean["hmc"].pop("auto_chains", None)
     # This only controls how often accumulated production observations are
     # checked for convergence. It does not alter the chain or saved data.
     clean["sampling"].pop("convergence_batch_total_samples", None)

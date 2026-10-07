@@ -47,7 +47,7 @@ class RecommendChainsTests(unittest.TestCase):
             root = Path(directory)
             original = self.config(root).read_bytes()
             with patch("cpn_gf.recommend._measure_candidate", side_effect=self.measure) as measure, \
-                    patch("cpn_gf.recommend.pilot_experiment") as pilot:
+                    patch("cpn_gf.runner.pilot_experiment") as pilot:
                 result = recommend_chains(root, max_chains=64)
             self.assertEqual(result["recommended_chains"], [8, 8])
             self.assertEqual([row["mul"] for row in result["runs"]], [1.2, 0.8])

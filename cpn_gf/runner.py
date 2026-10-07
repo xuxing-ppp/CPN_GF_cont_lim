@@ -21,20 +21,13 @@ from .hmc import BatchedHMC, tune
 from .io import atomic_json, atomic_npz, atomic_torch, load_checkpoint
 from .online_flow import flow_observables
 from .stats import jackknife_error, scale_statistics
+from .execution import device_for_config as _device
+from .recommend import _recommend_mul, recommendation_key
 
 
 # First public on-disk format of the refactored online pipeline. Increment only
 # when a future change makes existing manifests/checkpoints unsafe to resume.
 SCHEMA = 2
-
-
-def _device(cfg):
-    device = torch.device(cfg["compute"]["device"])
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("a CUDA device was requested but torch.cuda.is_available() is false")
-    if cfg["compute"]["deterministic"]:
-        torch.use_deterministic_algorithms(True)
-    return device
 
 
 def _advance(engine, count, desc=None):
@@ -132,16 +125,57 @@ def _write_checkpoint(run_dir, engine, phase, **extra):
 
 def _prepare_new(cfg, model, run_dir, seed):
     fixed_L = int(cfg["lattice"].get("L", 0))
+    if cfg["hmc"]["auto_chains"] and fixed_L == 0:
+        try:
+            manifest = _prepare_pilot(cfg, model, run_dir, seed, retry_oom=True)
+        except Exception as exc:
+            manifest = _base_manifest(cfg, model, run_dir, None, None, seed,
+                                      phase="pilot_error", status="error")
+            manifest["error"] = str(exc)
+            atomic_json(run_dir / "manifest.json", manifest)
+            _write_pilot_summary(run_dir.parent)
+            raise
+        _write_pilot_summary(run_dir.parent)
+        return _start_after_pilot(cfg, run_dir, manifest)
     pilot = ({"xi": None, "L": fixed_L, "step_size": None, "skipped": "fixed lattice"}
              if fixed_L > 0 else _run_pilot(cfg, model, seed + 1))
     L = fixed_L if fixed_L > 0 else int(pilot["L"])
     manifest = _base_manifest(cfg, model, run_dir, pilot, L, seed)
+    if cfg["hmc"]["auto_chains"]:
+        manifest.update(phase="pilot_complete", status="pilot_complete")
     atomic_json(run_dir / "manifest.json", manifest)
     return _start_after_pilot(cfg, run_dir, manifest)
 
 
 def _start_after_pilot(cfg, run_dir, manifest):
     """Start the independent production chain after a completed pilot."""
+    if cfg["hmc"]["auto_chains"]:
+        path = run_dir / "chains_recommendation.json"
+        key = recommendation_key(cfg, manifest["model"]["mul"], manifest["L"])
+        result = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+        def matches(row):
+            return (isinstance(row, dict) and row.get("status") == "complete"
+                    and row.get("key") == key and type(row.get("recommended_chains")) is int
+                    and row["recommended_chains"] >= 2)
+        if not matches(result):
+            summary = run_dir.parent / "chains_recommendations.json"
+            if summary.is_file():
+                rows = json.loads(summary.read_text(encoding="utf-8")).get("runs", [])
+                result = next((row for row in rows if matches(row)), None)
+        if not matches(result):
+            result = _recommend_mul(cfg, manifest["model"]["mul"], manifest["L"],
+                                    "saved pilot" if int(cfg["lattice"]["L"]) == 0 else "lattice.L",
+                                    manifest.get("pilot"), 1024, record_path=path)
+        atomic_json(path, result)
+        cfg["hmc"]["chains"] = result["recommended_chains"]
+        manifest["chain_recommendation"] = result
+        print(f"mul={manifest['model']['mul']:g} L={manifest['L']}: "
+              f"auto chains = {cfg['hmc']['chains']}", flush=True)
+    cfg["model"]["mul"] = [float(manifest["model"]["mul"])]
+    manifest.update(chains=cfg["hmc"]["chains"], hmc=deepcopy(cfg["hmc"]),
+                    config_fingerprint=fingerprint(cfg))
+    write_config(run_dir / "config.toml", cfg)
+    atomic_json(run_dir / "manifest.json", manifest)
     seed = int(manifest["run_seed"])
     engine = _new_engine(cfg, manifest["model"], manifest["L"],
                          manifest["chains"], seed + 2)
@@ -506,7 +540,7 @@ def pilot_experiment(experiment_dir, retry_oom=False):
             if run_family_fingerprint(cfg) != run_family_fingerprint(root_cfg):
                 raise ValueError(
                     f"{run_dir} differs from the experiment config in settings other than "
-                    "model.mul, hmc.chains, sampling.convergence_batch_total_samples, "
+                    "model.mul, hmc.chains, hmc.auto_chains, sampling.convergence_batch_total_samples, "
                     "sampling.relative_error, or analysis")
         if manifest_path.is_file():
             with manifest_path.open(encoding="utf-8") as fh:
@@ -521,6 +555,8 @@ def pilot_experiment(experiment_dir, retry_oom=False):
                             "action": "skipped", "pilot": manifest.get("pilot")})
         else:
             cfg["hmc"]["chains"] = config_for_mul(root_cfg, mul)["hmc"]["chains"]
+            cfg["hmc"]["auto_chains"] = root_cfg["hmc"]["auto_chains"]
+            cfg["model"]["mul"] = [mul]
             pending.append((mul, run_dir, cfg))
 
     for mul, run_dir, cfg in pending:
@@ -531,7 +567,8 @@ def pilot_experiment(experiment_dir, retry_oom=False):
         seed = _run_seed(cfg, mul)
         try:
             manifest = (_prepare_pilot(cfg, model, run_dir, seed, retry_oom=True)
-                        if retry_oom else _prepare_pilot(cfg, model, run_dir, seed))
+                        if retry_oom or cfg["hmc"]["auto_chains"]
+                        else _prepare_pilot(cfg, model, run_dir, seed))
         except Exception as exc:
             fixed_L = int(cfg["lattice"].get("L", 0))
             manifest = _base_manifest(
@@ -605,7 +642,7 @@ def resume_experiment(experiment_dir):
             if run_family_fingerprint(child_cfg) != run_family_fingerprint(root_cfg):
                 raise ValueError(
                     f"{run_dir} differs from the experiment config in settings other than "
-                    "model.mul, hmc.chains, sampling.convergence_batch_total_samples, "
+                    "model.mul, hmc.chains, hmc.auto_chains, sampling.convergence_batch_total_samples, "
                     "sampling.relative_error, or analysis")
             previous_relative_error = float(
                 manifest.get("sampling", {}).get(
@@ -619,6 +656,8 @@ def resume_experiment(experiment_dir):
                 if (run_dir / "checkpoint.pt").exists():
                     raise RuntimeError(f"{run_dir}: pilot_complete has a production checkpoint")
                 child_cfg["hmc"]["chains"] = config_for_mul(root_cfg, mul)["hmc"]["chains"]
+                child_cfg["hmc"]["auto_chains"] = root_cfg["hmc"]["auto_chains"]
+                child_cfg["model"]["mul"] = [mul]
             if manifest.get("phase") == "complete":
                 if current_relative_error < previous_relative_error:
                     checkpoint_path = run_dir / "checkpoint.pt"
@@ -666,11 +705,13 @@ def resume_experiment(experiment_dir):
             finished = _production(cfg, run_dir, engine, manifest, samples, chunks, streak)
             outputs.append({"mul": mul, "status": finished["status"], "action": "resumed"})
         except Exception as exc:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest.update(status="error", error=str(exc))
             atomic_json(manifest_path, manifest)
             raise
 
     for mul, run_dir in missing:
+        manifest_path = run_dir / "manifest.json"
         cfg = config_for_mul(root_cfg, mul)
         model = scaled_model(cfg, mul)
         run_dir.mkdir(exist_ok=True)
@@ -680,13 +721,15 @@ def resume_experiment(experiment_dir):
             if run_family_fingerprint(cfg) != run_family_fingerprint(root_cfg):
                 raise ValueError(
                     f"{run_dir} differs from the experiment config in settings other than "
-                    "model.mul, hmc.chains, sampling.convergence_batch_total_samples, "
+                    "model.mul, hmc.chains, hmc.auto_chains, sampling.convergence_batch_total_samples, "
                     "sampling.relative_error, or analysis")
             cfg["sampling"]["convergence_batch_total_samples"] = int(
                 root_cfg["sampling"]["convergence_batch_total_samples"])
             cfg["sampling"]["relative_error"] = float(
                 root_cfg["sampling"]["relative_error"])
             cfg["hmc"]["chains"] = config_for_mul(root_cfg, mul)["hmc"]["chains"]
+            cfg["hmc"]["auto_chains"] = root_cfg["hmc"]["auto_chains"]
+            cfg["model"]["mul"] = [mul]
             write_config(config_copy, cfg)
             model = scaled_model(cfg, mul)
         else:

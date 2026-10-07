@@ -11,9 +11,12 @@
 
 # 可添加新值；已有值继续或跳过，新值建立独立 run。删除值不会删除原目录。
 model.mul = [0.9, 0.95, 1.0, 1.05, 1.1, 1.15]
+# true：自动跑或复用 pilot，再为每个 mul 实测选择生产 chains，并打印最终值。
+# 固定 lattice.L 时直接推荐；生产热化开始后不再改变 chains。旧配置缺省为 false。
+hmc.auto_chains = true
 # 整数用于所有 mul；也可填与 model.mul 等长的数组，按顺序对应。
 # 例如 hmc.chains = [64, 64, 32, 32, 16, 16]。
-# 新 mul 和仅完成 pilot 的 mul 使用新值；生产热化开始后 chains 冻结。
+# auto_chains=true 时，此值只作为 pilot 的初始链数；false 时作为生产链数。
 hmc.chains = 64
 # 未完成 run 每新增约多少个 flow 构型检查一次误差。
 sampling.convergence_batch_total_samples = 2000

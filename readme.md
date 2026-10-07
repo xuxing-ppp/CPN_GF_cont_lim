@@ -15,10 +15,12 @@ python -m cpn_gf analyze --run runs/<experiment>
 
 `run` creates a timestamped experiment under `output.root`. `pilot --config`
 creates an experiment with only scale-selection pilots. Both print its path.
-For a named experiment, create `runs/my_experiment/` and put your configuration
-there as `config.toml`. Run `recommend-chains --run runs/my_experiment`, copy its
-final `hmc.chains = [...]` into that root config, then run `resume` to start
-production. Missing pilots are saved and existing pilots are reused.
+The example enables `hmc.auto_chains = true`: `run` automatically runs or reuses
+each mul's pilot, selects production chains, prints the chosen count, and starts
+production. With a fixed lattice it selects chains directly, without a pilot.
+For a named experiment, create `runs/my_experiment/`, put your configuration
+there as `config.toml`, and use `resume --run runs/my_experiment` for the same
+automatic workflow. The separate pilot and recommendation commands are optional.
 
 `--run` takes a directory, not a TOML file or the general `runs/` directory.
 Resume and analyze also accept an individual `mul_*` directory. Use
@@ -28,7 +30,11 @@ and summaries using existing per-mul JSON/NPZ results.
 
 ## Configuration and restart
 
-`hmc.chains` accepts an integer for all mul values or an integer array matching
+`hmc.auto_chains` defaults to `false` for compatibility with old configs; the
+example explicitly enables it. When enabled, `hmc.chains` supplies pilot initial
+chain counts, and production counts are measured automatically before warmup.
+With the switch disabled, `hmc.chains` sets production counts directly.
+It accepts an integer for all mul values or an integer array matching
 `model.mul` in length and order. Every count must be at least 2:
 
 ```toml
@@ -39,8 +45,9 @@ hmc.chains = [64, 32, 16]
 Update the chains array when adding, removing, or reordering mul values. Removing
 a mul excludes its directory from experiment resume and analysis without deleting
 it. Edit only the experiment root `config.toml`; child configs are managed
-automatically. New children and children with only a completed pilot use the
-latest root chains. Once production warmup starts, chains remain frozen for
+automatically and contain only `model.mul = [current_value]` and one integer
+chain count. New children and children with only a completed pilot use the
+latest root auto/manual setting. Once production warmup starts, chains remain frozen for
 exact checkpoint/RNG restoration. Resume handles interrupted children first,
 starts missing children, and skips completed children.
 
@@ -77,6 +84,13 @@ below 5%, OOM, or the memory limit. `--max-chains N` sets the ceiling (default
 1024). Details are saved incrementally in `chains_recommendations.json`.
 Rerunning benchmarks the current machine again. Root TOML and production
 checkpoints are never changed by this command.
+
+Automatic selection uses the same search and default ceiling of 1024, saving
+per-child diagnostics in `chains_recommendation.json` and the chosen result in
+the manifest. A matching completed result is reused before production starts;
+changed configuration or device information triggers a new benchmark. Existing
+production checkpoints always restore their frozen chains without benchmarking.
+`pilot` remains pilot-only even when automatic chains are enabled.
 
 ## Sampling, storage, and analysis
 

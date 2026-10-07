@@ -4,17 +4,33 @@ import gc
 import json
 import math
 import time
+import platform
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from .config import (config_for_mul, load_config, mul_directory_name,
-                     run_family_fingerprint, scaled_model)
+                     run_family_fingerprint, scaled_model, fingerprint)
 from .io import atomic_json
 from .hmc import BatchedHMC
 from .online_flow import flow_observables
-from .runner import _device, pilot_experiment
+from .execution import device_for_config as _device
+
+
+def recommendation_key(cfg, mul, L, max_chains=1024):
+    probe = config_for_mul(cfg, mul)
+    probe["hmc"]["chains"] = 2
+    device = _device(cfg)
+    hardware = {"platform": platform.platform(), "processor": platform.processor(),
+                "torch": torch.__version__, "device": str(device),
+                "cpu_count": os.cpu_count(), "torch_threads": torch.get_num_threads()}
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(device)
+        hardware.update(gpu=props.name, memory=props.total_memory, cuda=torch.version.cuda)
+    return {"config": fingerprint(probe), "L": int(L), "max_chains": max_chains,
+            "hardware": hardware}
 
 
 def _cuda_budget(device, fraction):
@@ -110,6 +126,7 @@ def recommend_chains(experiment_dir, max_chains=1024):
                 if not valid:
                     raise ValueError(f"{child}: invalid saved pilot")
     if int(cfg["lattice"]["L"]) == 0:
+        from .runner import pilot_experiment
         pilot_experiment(directory, retry_oom=True)
     result = {"experiment": str(directory), "device": cfg["compute"]["device"],
               "mul": list(cfg["model"]["mul"]), "runs": [], "recommended_chains": []}
@@ -132,13 +149,27 @@ def recommend_chains(experiment_dir, max_chains=1024):
     return result
 
 
-def _recommend_mul(cfg, mul, L, source, pilot, max_chains):
+def _recommend_mul(cfg, mul, L, source, pilot, max_chains, record_path=None):
 
     model = scaled_model(cfg, mul)
     rows, chains, slow_gains = [], 2, 0
+    result = {"recommended_chains": None, "L": L, "L_source": source,
+              "mul": mul, "device": str(cfg["compute"]["device"]),
+              "candidates": rows, "pilot": pilot, "status": "benchmarking",
+              "key": recommendation_key(cfg, mul, L, max_chains)}
+    if record_path is not None:
+        atomic_json(record_path, result)
     while chains <= int(max_chains):
-        row = _measure_candidate(cfg, model, L, chains)
+        try:
+            row = _measure_candidate(cfg, model, L, chains)
+        except Exception as exc:
+            result.update(status="error", error=str(exc))
+            if record_path is not None:
+                atomic_json(record_path, result)
+            raise
         rows.append(row)
+        if record_path is not None:
+            atomic_json(record_path, result)
         if row["status"] != "ok":
             break
         if len(rows) >= 2 and rows[-2]["status"] == "ok":
@@ -150,12 +181,16 @@ def _recommend_mul(cfg, mul, L, source, pilot, max_chains):
         chains *= 2
     eligible = [row for row in rows if row["status"] == "ok"]
     if not eligible:
+        result.update(status="error", error=f"no chain count fitted the device at L={L}")
+        if record_path is not None:
+            atomic_json(record_path, result)
         raise RuntimeError(f"no chain count fitted the device at L={L}")
     best = max(row["rate"] for row in eligible)
     recommended = min(row["chains"] for row in eligible if row["rate"] >= 0.95 * best)
-    return {"recommended_chains": recommended, "L": L, "L_source": source,
-            "mul": mul, "device": str(cfg["compute"]["device"]),
-            "best_rate": best, "candidates": rows, "pilot": pilot}
+    result.update(recommended_chains=recommended, best_rate=best, status="complete")
+    if record_path is not None:
+        atomic_json(record_path, result)
+    return result
 
 
 def print_recommendation(result):

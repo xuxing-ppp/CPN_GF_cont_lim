@@ -12,6 +12,7 @@ DEFAULTS = {
     "model": {"N": 2, "beta": 1.0, "beta1": 0.0, "alpha": 0.0,
               "alpha1": 0.0, "mod": 0, "mul": [1.0], "normalize": True},
     "lattice": {"L": 0, "L0": 50, "target_L0_over_xi": 2.0, "max_L0": None,
+                "pilot_growth_margin": 1.25,
                 "L_multiple": 6, "minimum_L": 6,
                 "pilot_warmup": 400, "pilot_total_samples": 10000},
     "hmc": {"chains": 64, "auto_chains": False, "warmup": 2000, "target_accept": 0.8,
@@ -76,6 +77,13 @@ def validate(cfg):
     if not math.isfinite(target_ratio) or target_ratio < 2:
         raise ValueError("lattice.target_L0_over_xi must be finite and at least 2")
     lat["target_L0_over_xi"] = target_ratio
+    try:
+        growth_margin = float(lat["pilot_growth_margin"])
+    except (TypeError, ValueError) as exc:
+        raise TypeError("lattice.pilot_growth_margin must be a number") from exc
+    if not math.isfinite(growth_margin) or growth_margin < 1:
+        raise ValueError("lattice.pilot_growth_margin must be finite and at least 1")
+    lat["pilot_growth_margin"] = growth_margin
     try:
         maximum = initial_L0 if lat["max_L0"] is None else float(lat["max_L0"])
     except (TypeError, ValueError) as exc:

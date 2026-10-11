@@ -444,11 +444,15 @@ root = "{output}"
             self.assertEqual(lattice["L0"], 37)
             self.assertEqual(lattice["max_L0"], 37)
             self.assertEqual(lattice["target_L0_over_xi"], 2.0)
+            self.assertEqual(lattice["pilot_growth_margin"], 1.25)
 
     def test_invalid_pilot_lattice_growth_config_is_rejected(self):
         cases = (("target_L0_over_xi = 1.9\nmax_L0 = 50", "at least 2"),
                  ("target_L0_over_xi = 2\nmax_L0 = 19", "greater than or equal"),
-                 ("L0 = 20.5\ntarget_L0_over_xi = 2\nmax_L0 = 50", "positive integer"))
+                 ("L0 = 20.5\ntarget_L0_over_xi = 2\nmax_L0 = 50", "positive integer"),
+                 ("pilot_growth_margin = 0.9", "at least 1"),
+                 ("pilot_growth_margin = nan", "finite"),
+                 ("pilot_growth_margin = inf", "finite"))
         for values, message in cases:
             with self.subTest(values=values), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "config.toml"
@@ -479,11 +483,35 @@ root = "{output}"
             result = _run_pilot(cfg, {"mul": 1.0}, 100)
 
         self.assertEqual([call.args[2:5:2] for call in create.call_args_list],
-                         [(20, 100), (25, 101)])
-        self.assertEqual(result["L0"], 25)
+                         [(20, 100), (31, 101)])
+        self.assertEqual(result["L0"], 31)
         self.assertEqual(result["attempt_count"], 2)
-        self.assertEqual([attempt["L0"] for attempt in result["attempts"]], [20, 25])
+        self.assertEqual([attempt["L0"] for attempt in result["attempts"]], [20, 31])
         self.assertEqual(result["recommended_L"], 60)
+
+    def test_pilot_custom_margin_and_pass_condition(self):
+        for margin, first_xi, sizes in ((1.0, 12.2, [20, 25]),
+                                         (1.5, 12.2, [20, 37]),
+                                         (1.5, 10.0, [20])):
+            with self.subTest(margin=margin, first_xi=first_xi):
+                cfg = {
+                    "lattice": {"L0": 20, "target_L0_over_xi": 2.0,
+                                "max_L0": 100, "pilot_growth_margin": margin,
+                                "pilot_warmup": 3, "pilot_total_samples": 8,
+                                "minimum_L": 6, "L_multiple": 6},
+                    "hmc": {"chains": 4, "target_accept": 0.8},
+                    "sampling": {"tau_window_c": 5.0},
+                }
+                estimates = [(xi, np.asarray([xi, xi]), 1.0)
+                             for xi in (first_xi, 10.0)]
+                with patch("cpn_gf.runner._new_engine") as create, \
+                        patch("cpn_gf.runner.tune"), \
+                        patch("cpn_gf.runner._collect_modes", return_value=object()), \
+                        patch("cpn_gf.runner.scale_statistics", side_effect=estimates):
+                    create.return_value.step_size = 0.025
+                    result = _run_pilot(cfg, {"mul": 1.0}, 100)
+                self.assertEqual([call.args[2] for call in create.call_args_list], sizes)
+                self.assertEqual(result["L0"], sizes[-1])
 
     def test_pilot_reports_failure_at_maximum_lattice(self):
         cfg = {
@@ -497,16 +525,15 @@ root = "{output}"
         class Engine:
             step_size = 0.025
 
-        with patch("cpn_gf.runner._new_engine", side_effect=[Engine(), Engine(), Engine()]) as create, \
+        with patch("cpn_gf.runner._new_engine", side_effect=[Engine(), Engine()]) as create, \
                 patch("cpn_gf.runner.tune"), \
                 patch("cpn_gf.runner._collect_modes", return_value=object()), \
                 patch("cpn_gf.runner.scale_statistics", side_effect=[
                     (12.0, np.asarray([12.0, 12.0]), 1.0),
-                    (13.0, np.asarray([13.0, 13.0]), 1.0),
                     (13.0, np.asarray([13.0, 13.0]), 1.0)]):
             with self.assertRaisesRegex(RuntimeError, "max_L0=25.*below target 2"):
                 _run_pilot(cfg, {"mul": 1.0}, 100)
-        self.assertEqual([call.args[2] for call in create.call_args_list], [20, 24, 25])
+        self.assertEqual([call.args[2] for call in create.call_args_list], [20, 25])
 
     def test_analysis_uses_only_muls_listed_in_root_config(self):
         with tempfile.TemporaryDirectory() as directory:

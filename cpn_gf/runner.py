@@ -56,6 +56,7 @@ def _run_pilot(cfg, model, seed):
     current_L0 = int(lat["L0"])
     maximum_L0 = int(lat["max_L0"])
     target_ratio = float(lat["target_L0_over_xi"])
+    growth_margin = float(lat.get("pilot_growth_margin", 1.25))
     per_chain = math.ceil(int(lat["pilot_total_samples"]) / chains)
     attempts = []
 
@@ -86,7 +87,7 @@ def _run_pilot(cfg, model, seed):
             raise RuntimeError(
                 f"pilot reached lattice.max_L0={maximum_L0} with xi={xi:.8g} "
                 f"and L0/xi={ratio:.8g}, below target {target_ratio:.8g}")
-        current_L0 = min(maximum_L0, math.ceil(target_ratio * float(xi)))
+        current_L0 = min(maximum_L0, math.ceil(growth_margin * target_ratio * float(xi)))
 
     L = max(int(lat["minimum_L"]), int(lat["L_multiple"]) * math.ceil(xi))
     return {"xi": float(xi), "xi_error": xi_error, "tau_max": float(tau),

@@ -49,6 +49,9 @@ lattice.L = 0
 lattice.L0 = 50
 # pilot 要求中心估计满足 L0/xi 不小于此值；不足时会增大 L0 并重跑。
 lattice.target_L0_over_xi = 2.5
+# 尺寸不足时取 ceil(pilot_growth_margin * target_L0_over_xi * xi)，再受 max_L0 限制。
+# 默认预留 25% 扩容余量；设为 1 恢复无余量规则，不改变 pilot 的通过条件。
+lattice.pilot_growth_margin = 1.25
 # 自动扩展试探格点的上限；到达上限仍不满足目标时会报错。
 lattice.max_L0 = 100
 # 自动格点取 L=L_multiple*ceil(xi_pilot)，再受 minimum_L 下限约束。
